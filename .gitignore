@@ -1,0 +1,6 @@
+build/
+# private notes and screenshots (personal account details): kept local
+docs/subhub-macos-plan.md
+docs/preview.png
+docs/preview-add.png
+.DS_Store

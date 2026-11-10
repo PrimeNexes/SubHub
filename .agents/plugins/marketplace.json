@@ -1,0 +1,8 @@
+{
+  "name": "subhub",
+  "owner": { "name": "Pranay Desai" },
+  "metadata": { "description": "SubHub: use your other AI subscriptions as sub-agents from any agent.", "version": "1.0.1" },
+  "plugins": [
+    { "name": "subhub", "source": "./plugins/subhub", "description": "Hand work to your other AI subscriptions as sub-agents.", "version": "1.0.1" }
+  ]
+}
