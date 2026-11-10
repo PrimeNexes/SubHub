@@ -23,7 +23,7 @@ import crypto from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-const VERSION = "1.3.0";
+const VERSION = "0.3.0-alpha";
 const WIN = process.platform === "win32", MAC = process.platform === "darwin";
 const HOME = os.homedir();
 const SH = path.join(HOME, ".subhub"), REG = path.join(SH, "registry.json"), CFG = path.join(SH, "config.json");
