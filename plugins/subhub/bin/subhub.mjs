@@ -6,7 +6,7 @@
 //   subhub list [--refresh]            the subs, what each is for, its limits and models (agents read this)
 //   subhub models <sub>                every model that sub offers
 //   subhub ask [--in <folder>] <sub> <model|default> [brief | --brief-file <file> | brief on stdin]
-//   subhub status [--json] [--refresh] subs, agents and found accounts (the app reads --json)
+//   subhub status [--json] [--refresh] subs, agents and found accounts (--json for scripts)
 //   subhub install [--no-rules]        put subhub on PATH and connect every installed agent
 //   subhub connect|disconnect <agent|all> [--no-rules]   claude, codex, gemini (Antigravity), cursor
 //                                      (connect adds an always-on rule to the agent's global rules file; SUBHUB_NO_RULES=1 skips it)

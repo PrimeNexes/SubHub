@@ -69,8 +69,6 @@ Or install the plugin through each agent's own plugin manager:
 
 Then run `node <plugin folder>/bin/subhub.mjs install` once. It adds the permission rules and finds your accounts.
 
-**macOS app (optional):** `SubHub.app` is setup and status only. Its Install button runs the same installer, and the window shows your subs and agents. Sign-ins open in Terminal.
-
 ## Use it
 
 Ask any connected agent in plain words:
@@ -152,7 +150,6 @@ plugins/subhub/
   bin/subhub, bin/subhub.cmd      launchers for macOS/Linux and Windows
 test/smoke.mjs                    test against stand-in CLIs and a stand-in Ollama (CI: macOS, Linux, Windows)
 install.sh, install.ps1           one-line installers (macOS/Linux, Windows)
-SubHub/                           optional macOS app (setup + status)
 ```
 
 ## Requirements
