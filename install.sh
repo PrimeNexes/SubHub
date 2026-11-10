@@ -3,7 +3,7 @@
 # Gets the repo (or uses this checkout), installs `subhub`, and connects every AI agent installed here.
 set -e
 REPO=${SUBHUB_GIT:-https://github.com/PrimeNexes/SubHub.git}
-here=$(cd "$(dirname "$0")" 2>/dev/null && pwd -P || true)
+here=; case $0 in */install.sh|install.sh) here=$(cd "$(dirname "$0")" 2>/dev/null && pwd -P) ;; esac   # piped into sh: download
 if [ -n "$here" ] && [ -x "$here/plugins/subhub/bin/subhub" ]; then src=$here
 else
   src="$HOME/.subhub/src"
