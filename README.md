@@ -8,13 +8,23 @@ You pay for several AI subscriptions: a second Claude account, a team and a pers
 - parallel side work
 - carrying on after a usage limit
 
-SubHub is a plugin with two skills, for Claude Code, Codex and Antigravity, and for Cursor through its skills folder. One shell script, `subhub`, does the work. There's no server and no background process.
+SubHub is a plugin with two skills, for Claude Code, Codex and Antigravity, and for Cursor through its skills folder. It runs on **macOS, Linux and Windows**. One Node.js file, `subhub.mjs`, does the work, using only Node's built-in modules. There's no server and no background process.
 
 ## Install
+
+**macOS and Linux:**
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/PrimeNexes/SubHub/main/install.sh | sh
 ```
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/PrimeNexes/SubHub/main/install.ps1 | iex
+```
+
+Both need [Node.js](https://nodejs.org) 18 or newer. On Windows, `winget install OpenJS.NodeJS.LTS` installs it.
 
 `subhub install` does four things:
 - puts `subhub` in `~/.local/bin`
@@ -32,7 +42,7 @@ Or install the plugin through each agent's own plugin manager:
 | Cursor | copy `plugins/subhub/skills/subhub` to `~/.cursor/skills/` |
 | Any agent | `npx skills add PrimeNexes/SubHub` (the [Agent Skills](https://agentskills.io) standard) |
 
-Then run `subhub install` once, from the plugin's `bin/` folder or the repo. It adds the permission rules and finds your accounts.
+Then run `node <plugin folder>/bin/subhub.mjs install` once. It adds the permission rules and finds your accounts.
 
 **macOS app (optional):** `SubHub.app` is setup and status only. Its Install button runs the same installer, and the window shows your subs and agents. Sign-ins open in Terminal.
 
@@ -90,7 +100,7 @@ SubHub talks to Ollama's API (`OLLAMA_HOST`, local or remote). It doesn't use `o
 
 **Ollama using your other subs:** `subhub ollama [--model M] [task]` runs a local model as an agent with two extra tools, `subhub_list` and `subhub_ask`, so it can hand work to Claude, Codex, Gemini and the rest. Without a task it opens a chat. You can also run Claude Code or Codex on an Ollama model (`ollama launch claude`, `ollama launch codex`). They already have the SubHub plugin.
 
-SubHub never starts Ollama or downloads models. The Ollama runner (`bin/subhub-ollama`) needs `python3`. Without it, Ollama falls back to `ollama run` and is text only.
+SubHub never starts Ollama or downloads models.
 
 ## Settings
 
@@ -113,13 +123,15 @@ plugins/subhub/
   plugin.json                     Antigravity plugin
   skills/subhub/SKILL.md          delegate to a sub (Agent Skills format)
   skills/subhub-config/SKILL.md   settings and setup
-  bin/subhub                      the engine (POSIX sh; plutil on macOS, python3 elsewhere)
-install.sh                        one-line installer
+  bin/subhub.mjs                  the engine (Node.js 18+, built-in modules only)
+  bin/subhub, bin/subhub.cmd      launchers for macOS/Linux and Windows
+test/smoke.mjs                    test against stand-in CLIs and a stand-in Ollama (CI: macOS, Linux, Windows)
+install.sh, install.ps1           one-line installers (macOS/Linux, Windows)
 SubHub/                           optional macOS app (setup + status)
 ```
 
 ## Requirements
 
-macOS, or Linux with `python3`, plus at least two AI CLIs signed in. Each sub's usage counts against that subscription. Check each provider's terms on scripted use and on using several accounts.
+macOS, Linux or Windows with Node.js 18+, plus at least two AI CLIs signed in. Each sub's usage counts against that subscription. Check each provider's terms on scripted use and on using several accounts.
 
 MIT licence.

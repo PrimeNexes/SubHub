@@ -6,7 +6,7 @@ allowed-tools: Bash(subhub *)
 
 # SubHub: delegate to the user's other AI subscriptions
 
-Always run the command as plain `subhub …`, one command per call, with nothing chained before or after it (no `||`, `&&`, `;` or pipes): that's what the user allowed to run without a prompt. If `subhub` isn't found, tell the user to install SubHub: `sh <this skill's folder>/../../bin/subhub install`.
+Always run the command as plain `subhub …`, one command per call, with nothing chained before or after it (no `||`, `&&`, `;` or pipes): that's what the user allowed to run without a prompt. If `subhub` isn't found, tell the user to install SubHub: `node <this skill's folder>/../../bin/subhub.mjs install` (needs Node.js 18+; macOS, Linux and Windows).
 
 1. Run `subhub list` once per task. It shows the user's subs in their order of preference: account, what each is for, what it can and can't do, and its models. Never pick a sub that is the account you are running as (SubHub refuses it anyway).
 2. Run one sub. Put the brief between the two marker lines; the last line must be exactly SUBHUB_BRIEF_END:
@@ -16,6 +16,8 @@ subhub ask <sub> <model-or-default> <<'SUBHUB_BRIEF_END'
 <brief>
 SUBHUB_BRIEF_END
 ```
+
+Heredocs work in bash and zsh (Claude Code uses bash on Windows too). Where there's no heredoc (PowerShell, cmd), save the brief to a file first, then run `subhub ask <sub> <model> --brief-file <file>`; a short brief can also go in quotes as the 3rd argument.
 
 To run in another folder (a git worktree you made for it): `subhub ask --in <folder> <sub> <model> <<'SUBHUB_BRIEF_END'`. All models of one sub: `subhub models <sub>`.
 
