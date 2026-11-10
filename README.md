@@ -1,6 +1,13 @@
-# SubHub
+# SubHub (alpha)
 
 Use your other AI subscriptions as sub-agents, from any AI agent on your computer.
+
+> **Alpha.** SubHub is early and changes often. Commands, settings and file locations may change between versions without a migration.
+> - It's developed and used on macOS. Linux and Windows are covered only by an automated test against stand-in CLIs.
+> - The installer changes each agent's settings and global rules file (it backs each one up first, and `subhub disconnect all` undoes it).
+> - Subs run with full access and no approval prompts.
+>
+> Try it on a machine and accounts you can afford to have go wrong, and please [report problems](https://github.com/PrimeNexes/SubHub/issues).
 
 You pay for several AI subscriptions: a second Claude account, a team and a personal organization on one email, Codex, Cursor, Antigravity (Gemini), a local Ollama. SubHub lets whichever agent you're working in hand a task to any of the others. Uses include:
 - a second opinion from another model family
