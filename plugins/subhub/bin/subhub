@@ -12,12 +12,13 @@
 #   subhub signin <sub>|claude --new [--email you@x.com] [--team]   sign an account in (interactive)
 #   subhub remove <sub>              stop using a sub; discovery won't add it back
 #   subhub on|off <sub>              turn a sub on or off
+#   subhub ollama [--model M] [task] a local Ollama model as an agent that can hand work to your other subs
 #   subhub config                    the settings file (on/off, use_for, model, notes, order)
 #
 # Exit codes of ask: 0 answer on stdout · 2 bad sub, model or folder · 3 loop guard · 4 empty answer
 # 6 that sub is you · 7 not signed in / app not running · 8 turned off · 10 signed in as another account
 # 124 timeout · 127 CLI missing
-VERSION=1.0.2
+VERSION=1.1.0
 SH="$HOME/.subhub"; REG="$SH/registry.tsv"; CFG="$SH/config.json"; IGN="$SH/ignored"; CACHE="$SH/cache"
 TAB=$(printf '\t')
 export USER="${USER:-$(id -un)}" LOGNAME="${LOGNAME:-$(id -un)}"   # Claude reads its Keychain sign-in by user name
@@ -55,7 +56,8 @@ limits() { case $1 in
   codex) echo "Full Codex agent (files, shell, network), no sandbox. OpenAI models: a real second opinion" ;;
   cursor) echo "Full Cursor agent (files, shell, its MCP servers), no sandbox. Models from the Cursor plan" ;;
   gemini) echo "Full Antigravity agent (files, shell, web), every permission auto-approved. Google models: a real second opinion" ;;
-  ollama) echo "Text only: can't open files, run commands or browse; put everything in the brief or add < file. Runs on this computer: private and free, weaker at complex tasks. Only while Ollama is running: never start it" ;; esac; }
+  ollama) if ollama_runner_ok; then echo "Depends on the model (see Models). With tools it's a full agent (files, shell; web search with OLLAMA_API_KEY); with vision it reads image files named in the brief; audio models get .wav files transcribed; without tools it answers from the brief only. Local models are private and free, smaller ones weaker at complex tasks. Only while Ollama runs: never start it"
+    else echo "Text only (python3 not found, so SubHub uses ollama run): can't open files, run commands or browse; put everything in the brief or add < file; vision models read image paths named in the brief. Only while Ollama runs: never start it"; fi ;; esac; }
 
 # ---------- who an account is: "email|org|label" (empty: signed out) ----------
 claude_who() {   # $1 bin, $2 folder ("" = the default sign-in)
@@ -139,17 +141,32 @@ refresh() {
   fi
   if b=$(bin_for cursor) && [ -n "$b" ]; then track cursor "" "$(cursor_who "$b")"; fi
   if b=$(bin_for gemini) && [ -n "$b" ]; then track gemini "" "$(gemini_who "$b")"; fi
-  if b=$(bin_for ollama) && [ -n "$b" ]; then
+  if [ -n "$(bin_for ollama)" ] || [ -n "${OLLAMA_HOST:-}" ] || grep -q "^ollama-" "$new"; then
     if t=$(curl -s -m 2 "$(ollama_url)/api/tags"); then
-      printf '%s' "$t" | grep -o '"name":"[^"]*"' | sed 's/"name":"//; s/"$//' | grep -v cloud > "$CACHE/ollama-models.txt"
+      printf '%s' "$t" | tr -d ' \n' | grep -o '"name":"[^"]*"' | sed 's/"name":"//; s/"$//' > "$CACHE/ollama-models.txt"
+      # name, capabilities (completion,vision,tools,thinking,audio,…), context, size, local|cloud — from /api/show
+      if ollama_runner_ok; then python3 "$OLLAMA_RUNNER" caps > "$CACHE/ollama-models.tsv" 2>/dev/null; else : > "$CACHE/ollama-models.tsv"; fi
       old=$(awk -F"$TAB" '$2=="ollama"' "$new" | head -1)
-      setline "$( [ -n "$old" ] && reg_field "$old" 1 || next_name ollama "$new")" ollama "" "this computer" local "Ollama" ok
+      where="this computer"; case $(ollama_url) in *127.0.0.1*|*localhost*) ;; *) where=$(ollama_url) ;; esac
+      setline "$( [ -n "$old" ] && reg_field "$old" 1 || next_name ollama "$new")" ollama "" "$where" local "Ollama" ok
     else
       old=$(awk -F"$TAB" '$2=="ollama"' "$new" | head -1)
       [ -n "$old" ] && setline "$(reg_field "$old" 1)" ollama "" "this computer" local Ollama stopped
     fi
   fi
   sort -t"$TAB" -k1,1V "$new" > "$REG"; rm -f "$new"
+}
+# The Ollama runner (python3): API, tools, images, audio. Without python3, Ollama falls back to `ollama run` (text only).
+OLLAMA_RUNNER=$( [ -f "$SH/bin/subhub-ollama" ] && echo "$SH/bin/subhub-ollama" || echo "$(cd "$(dirname "$0")" && pwd -P)/subhub-ollama")
+py_ok() {   # a real python3 (on macOS without developer tools, /usr/bin/python3 only offers to install them)
+  command -v python3 >/dev/null 2>&1 || return 1
+  [ "$(uname)" != Darwin ] || [ "$(command -v python3)" != /usr/bin/python3 ] || xcode-select -p >/dev/null 2>&1
+}
+ollama_runner_ok() { py_ok && [ -f "$OLLAMA_RUNNER" ]; }
+ollama_default() {   # the user's pick, else the first local model that can use tools, else the first model
+  m=$(pref "$(awk -F"$TAB" '$2=="ollama"{print $1; exit}' "$REG")" model); [ -n "$m" ] && { echo "$m"; return; }
+  m=$(awk -F"$TAB" '$5!="cloud" && (","$2",") ~ /,tools,/ {print $1; exit}' "$CACHE/ollama-models.tsv" 2>/dev/null)
+  [ -n "$m" ] && echo "$m" || head -1 "$CACHE/ollama-models.txt" 2>/dev/null
 }
 ollama_url() { u=${OLLAMA_HOST:-127.0.0.1:11434}; case $u in http*) echo "$u" ;; *) echo "http://$u" ;; esac; }
 fresh() { [ "$1" = --refresh ] || [ ! -s "$REG" ] || [ -n "$(find "$REG" -mmin +2 2>/dev/null)" ] && refresh; true; }
@@ -177,7 +194,14 @@ models() {  # $1 sub line, $2 short|full
       i=0; while s=$(jget "$j" "models.$i.slug"); do
         [ "$(jget "$j" "models.$i.visibility")" = list ] && printf -- "- \`%s\`: %s. %s; %sK context\n" "$s" "$(jget "$j" "models.$i.display_name")" "$(jget "$j" "models.$i.description" | sed 's/\.$//')" "$(( $(jget "$j" "models.$i.context_window" || echo 0) / 1000 ))"
         i=$((i+1)); done ;;
-    ollama) sed 's/.*/- `&`/' "$CACHE/ollama-models.txt" 2>/dev/null ;;
+    ollama) if [ -s "$CACHE/ollama-models.tsv" ]; then
+        awk -F"$TAB" '{ c=","$2","; f="";
+          if (c ~ /,tools,/) f=f ", agent with tools"; if (c ~ /,vision,/) f=f ", reads images"; if (c ~ /,audio,/) f=f ", transcribes .wav";
+          if (c ~ /,thinking,/) f=f ", thinks"; if (c ~ /,embedding,/ && c !~ /,completion,/) f=", embeddings only: not for tasks";
+          if (c !~ /,tools,/ && c ~ /,completion,/) f=f ", text only";
+          k=($3>=1000) ? int($3/1024) "K context" : ""; where=($5=="cloud") ? "; runs on ollama.com (your Ollama account)" : "";
+          printf "- `%s`: %s%s%s%s\n", $1, $4, (k!="" ? ", " k : ""), f, where }' "$CACHE/ollama-models.tsv"
+      else sed 's/.*/- `&`/' "$CACHE/ollama-models.txt" 2>/dev/null; fi ;;
   esac
 }
 
@@ -243,7 +267,7 @@ cmd_ask() {
   [ "$model" = default ] && { m=$(pref "$sub" model); [ -n "$m" ] && model=$m; }
   case $model in ''|*[!]A-Za-z0-9._:/[-]*) die 2 "'$model' isn't a model name." ;; esac
   notes=$(pref "$sub" notes)
-  bin=$(bin_for "$p"); [ -n "$bin" ] && [ -x "$bin" ] || die 127 "$sub's CLI isn't installed."
+  bin=$(bin_for "$p"); { [ "$p" = ollama ] && ollama_runner_ok; } || { [ -n "$bin" ] && [ -x "$bin" ]; } || die 127 "$sub's CLI isn't installed."
   last=; stdin=
   case $p in
     claude)
@@ -258,11 +282,14 @@ cmd_ask() {
       set -- "$bin" exec --sandbox danger-full-access --skip-git-repo-check -c 'approval_policy="never"' ;;
     cursor) set -- "$bin" --force --sandbox disabled --trust --approve-mcps; last=-p ;;
     gemini) set -- "$bin" --dangerously-skip-permissions; last=-p ;;
-    ollama) stdin=1; tags=$(curl -s -m 2 "$(ollama_url)/api/tags") || die 7 "Ollama isn't running. Start it yourself; SubHub never starts it."
-      [ "$model" = default ] && model=$(head -1 "$CACHE/ollama-models.txt" 2>/dev/null)
+    ollama) stdin=1; tags=$(curl -s -m 2 "$(ollama_url)/api/tags" | tr -d ' \n') || die 7 "Ollama isn't running at $(ollama_url). Start it yourself; SubHub never starts it."
+      [ "$model" = default ] && model=$(ollama_default)
+      [ -n "$model" ] || die 7 "Ollama has no models. Pull one yourself (ollama pull <model>); SubHub never downloads models."
       case $model in *:*) ;; *) model=$model:latest ;; esac
       case $tags in *"\"name\":\"$model\""*) ;; *) die 7 "$model isn't installed in Ollama, and SubHub won't download it." ;; esac
-      set -- "$bin" run "$model" --hidethinking --nowordwrap; model=default ;;
+      if ollama_runner_ok; then set -- python3 "$OLLAMA_RUNNER" run --model "$model"
+      else set -- "$bin" run "$model" --hidethinking --nowordwrap; fi
+      model=default ;;
   esac
   brief="Task from another AI agent. You're its sub-agent, working in $(pwd). You run headless: nobody can answer questions, so make sensible choices and finish. If you change any files, list them at the end.
 $task"
@@ -393,6 +420,7 @@ cmd_onoff() {
 cmd_install() {
   mkdir -p "$SH/bin" "$HOME/.local/bin"
   cp "$0" "$SH/bin/subhub"; chmod 755 "$SH/bin/subhub"
+  [ -f "$(dirname "$0")/subhub-ollama" ] && cp "$(dirname "$0")/subhub-ollama" "$SH/bin/subhub-ollama" && chmod 755 "$SH/bin/subhub-ollama"
   ln -sf "$SH/bin/subhub" "$HOME/.local/bin/subhub"
   migrate
   echo "SubHub $VERSION: installed as ~/.local/bin/subhub"
@@ -479,6 +507,10 @@ case $1 in
   signin) shift; cmd_signin "$@" ;;
   remove) shift; cmd_remove "$@" ;;
   on|off) cmd_onoff "$1" "$2" ;;
+  ollama) shift; ollama_runner_ok || die 127 "subhub ollama needs python3."; fresh
+    m=; [ "$1" = --model ] && { m=$2; shift 2; }; [ -n "$m" ] || m=$(ollama_default)
+    [ -n "$m" ] || die 7 "Ollama isn't running or has no models."
+    SUBHUB_BIN="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")" exec python3 "$OLLAMA_RUNNER" chat --model "$m" "$@" ;;
   config) echo "$CFG:"; cat "$CFG" 2>/dev/null || echo '(none yet: {"subs":{"<sub>":{"on":true,"use_for":"","model":"default","notes":""}},"order":[]})' ;;
   version|--version) echo "subhub $VERSION" ;;
   *) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ;;

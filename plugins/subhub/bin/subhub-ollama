@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""SubHub's Ollama runner: turns any Ollama model into a sub-agent, or into an agent that uses the other subs.
+
+Talks to Ollama's HTTP API (/api/chat, /api/show), not `ollama run`, so every feature the model reports can be used:
+  tools     -> the model works as an agent: read/write files, list folders, run commands, and (with OLLAMA_API_KEY)
+               Ollama's web_search / web_fetch; as a driver it can also call your other subs through `subhub`
+  vision    -> image files named in the brief are attached (base64, as /api/chat expects)
+  thinking  -> thinking is on (level from SUBHUB_OLLAMA_THINK, else the model's default); only the answer is printed
+  audio     -> .wav files named in the brief are transcribed with /v1/audio/transcriptions first
+  context   -> num_ctx is raised to the model's maximum, capped at SUBHUB_OLLAMA_CTX (default 65536)
+Models without a capability simply don't get that feature. Standard library only; Ollama's docs: docs.ollama.com/api
+
+  subhub-ollama caps                         one line per installed model: name, capabilities, context, size
+  subhub-ollama run  --model M [BRIEF]       one task as a sub (BRIEF or stdin); prints the answer
+  subhub-ollama chat --model M [TASK]        a local agent that can hand work to your other subs (REPL without TASK)
+"""
+import base64, json, os, re, subprocess, sys, urllib.error, urllib.request, uuid
+
+HOST = os.environ.get("OLLAMA_HOST", "127.0.0.1:11434")
+HOST = HOST if HOST.startswith("http") else "http://" + HOST
+KEY = os.environ.get("OLLAMA_API_KEY", "")
+MAX_STEPS = int(os.environ.get("SUBHUB_OLLAMA_STEPS", "40"))
+CTX_CAP = int(os.environ.get("SUBHUB_OLLAMA_CTX", "65536"))
+SUBHUB = os.environ.get("SUBHUB_BIN") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "subhub")
+IMG = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
+
+
+def api(path, body=None, base=HOST, timeout=1800, auth=False):
+    req = urllib.request.Request(base + path, data=None if body is None else json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json", **({"Authorization": "Bearer " + KEY} if auth else {})})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        raise SystemExit(f"Ollama: {path} failed ({e.code}): {e.read().decode(errors='replace')[:300]}")
+    except urllib.error.URLError as e:
+        raise SystemExit(f"Ollama isn't reachable at {HOST} ({e.reason}). Start it yourself; SubHub never starts it.")
+
+
+def show(model):
+    d = api("/api/show", {"model": model}, timeout=30)
+    info = d.get("model_info") or {}
+    ctx = next((v for k, v in info.items() if k.endswith(".context_length") and isinstance(v, int)), 0)
+    return {"caps": d.get("capabilities") or [], "ctx": ctx, "size": (d.get("details") or {}).get("parameter_size", ""),
+            "think": (d.get("thinking") or {})}
+
+
+def cmd_caps():
+    for m in (api("/api/tags", timeout=10).get("models") or []):
+        name = m.get("name") or m.get("model")
+        try:
+            s = show(name)
+        except SystemExit:
+            continue
+        cloud = "cloud" if (m.get("remote_host") or ":cloud" in name or name.endswith("-cloud")) else "local"
+        print("\t".join([name, ",".join(s["caps"]), str(s["ctx"]), s["size"], cloud]))
+
+
+# ---------- tools ----------
+def t_read_file(path, max_bytes=200000):
+    with open(os.path.expanduser(path), "rb") as f:
+        data = f.read(int(max_bytes))
+    return data.decode(errors="replace")
+
+def t_write_file(path, content):
+    p = os.path.expanduser(path)
+    os.makedirs(os.path.dirname(os.path.abspath(p)), exist_ok=True)
+    with open(p, "w") as f:
+        f.write(content)
+    return f"wrote {len(content)} characters to {path}"
+
+def t_list_dir(path="."):
+    p = os.path.expanduser(path)
+    return "\n".join(sorted(e + ("/" if os.path.isdir(os.path.join(p, e)) else "") for e in os.listdir(p))[:500])
+
+def t_run_command(command, timeout=300):
+    r = subprocess.run(["/bin/sh", "-c", command], capture_output=True, text=True, timeout=int(timeout))
+    return f"exit {r.returncode}\n{r.stdout[-20000:]}{r.stderr[-5000:]}"
+
+def t_web_search(query, max_results=5):
+    return json.dumps(api("/api/web_search", {"query": query, "max_results": int(max_results)}, base="https://ollama.com", auth=True, timeout=60).get("results", []))[:20000]
+
+def t_web_fetch(url):
+    d = api("/api/web_fetch", {"url": url}, base="https://ollama.com", auth=True, timeout=60)
+    return (d.get("title", "") + "\n" + d.get("content", ""))[:20000]
+
+def t_subhub_list():
+    return subprocess.run([SUBHUB, "list"], capture_output=True, text=True, timeout=120).stdout
+
+def t_subhub_ask(sub, brief, model="default"):
+    r = subprocess.run([SUBHUB, "ask", sub, model, brief], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    return f"exit {r.returncode}\n{r.stdout[-20000:]}{r.stderr[-3000:]}"
+
+def spec(name, desc, props, req):
+    return {"type": "function", "function": {"name": name, "description": desc,
+            "parameters": {"type": "object", "properties": props, "required": req}}}
+
+S = {"type": "string"}; N = {"type": "integer"}
+TOOLS = {
+    "read_file": (t_read_file, spec("read_file", "Read a text file.", {"path": S, "max_bytes": N}, ["path"])),
+    "write_file": (t_write_file, spec("write_file", "Create or overwrite a file with the given content.", {"path": S, "content": S}, ["path", "content"])),
+    "list_dir": (t_list_dir, spec("list_dir", "List a folder.", {"path": S}, [])),
+    "run_command": (t_run_command, spec("run_command", "Run a shell command in the working folder; returns exit code and output.", {"command": S, "timeout": N}, ["command"])),
+}
+WEB = {
+    "web_search": (t_web_search, spec("web_search", "Search the web (Ollama web search).", {"query": S, "max_results": N}, ["query"])),
+    "web_fetch": (t_web_fetch, spec("web_fetch", "Fetch a web page's text.", {"url": S}, ["url"])),
+}
+SUBS = {
+    "subhub_list": (t_subhub_list, spec("subhub_list", "List the user's other AI subscriptions (subs): what each is for, limits, models.", {}, [])),
+    "subhub_ask": (t_subhub_ask, spec("subhub_ask", "Hand a self-contained task to one sub; returns its answer.",
+                                      {"sub": S, "brief": S, "model": {"type": "string", "description": "a model id from subhub_list, or default"}}, ["sub", "brief"])),
+}
+
+
+# ---------- media in the brief ----------
+def paths_in(text, exts):
+    out = []
+    for m in re.findall(r"(?:~|\.{0,2}/)?[\w@%+=:,./~-]+", text):
+        p = os.path.expanduser(m.strip(".,;:()\"'"))
+        if p.lower().endswith(exts) and os.path.isfile(p) and p not in out:
+            out.append(p)
+    return out
+
+def transcribe(path, model):
+    boundary = uuid.uuid4().hex
+    body = b"".join([
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model}\r\n".encode(),
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\ntext\r\n".encode(),
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{os.path.basename(path)}\"\r\nContent-Type: audio/wav\r\n\r\n".encode(),
+        open(path, "rb").read(), f"\r\n--{boundary}--\r\n".encode()])
+    req = urllib.request.Request(HOST + "/v1/audio/transcriptions", data=body,
+                                 headers={"Content-Type": "multipart/form-data; boundary=" + boundary})
+    try:
+        with urllib.request.urlopen(req, timeout=600) as r:
+            return r.read().decode(errors="replace").strip()
+    except urllib.error.URLError as e:
+        return f"(couldn't transcribe: {e})"
+
+
+# ---------- the agent loop ----------
+def agent(model, task, driver, history=None):
+    s = show(model)
+    caps = s["caps"]
+    tools = {}
+    if "tools" in caps:
+        tools.update(TOOLS)
+        if KEY:
+            tools.update(WEB)
+        depth = int(os.environ.get("SUBHUB_DEPTH", "0")); maxd = int(os.environ.get("SUBHUB_MAX_DEPTH", "1"))
+        if driver and depth < maxd and os.path.exists(SUBHUB):
+            tools.update(SUBS)
+    msg = {"role": "user", "content": task}
+    if "vision" in caps:
+        imgs = paths_in(task, IMG)
+        if imgs:
+            msg["images"] = [base64.b64encode(open(p, "rb").read()).decode() for p in imgs]
+    if "audio" in caps:
+        for w in paths_in(task, (".wav",)):
+            msg["content"] += f"\n\nTranscript of {w}:\n{transcribe(w, model)}"
+    if history is None:
+        history = []
+        sys_text = ("You are working as an agent on the user's computer, in " + os.getcwd() + ". "
+                    + ("Use your tools to read, change and check things instead of guessing. " if tools else "You have no tools: answer from the text you are given. ")
+                    + ("You can hand self-contained tasks to the user's other AI subscriptions with subhub_list and subhub_ask; "
+                       "pick the sub that fits, never put secrets in a brief, and check what they return. " if "subhub_ask" in tools else "")
+                    + "Finish the task, then give a short final answer.")
+        history.append({"role": "system", "content": sys_text})
+    history.append(msg)
+    opts = {}
+    if s["ctx"]:
+        opts["num_ctx"] = min(s["ctx"], CTX_CAP)
+    req = {"model": model, "messages": history, "stream": False, "options": opts}
+    if tools:
+        req["tools"] = [t[1] for t in tools.values()]
+    think = os.environ.get("SUBHUB_OLLAMA_THINK")
+    if "thinking" in caps:
+        req["think"] = {"true": True, "false": False}.get(think, think) if think else True
+    for _ in range(MAX_STEPS):
+        out = api("/api/chat", req)["message"]
+        calls = out.get("tool_calls") or []
+        history.append({k: v for k, v in out.items() if k in ("role", "content", "tool_calls", "thinking")})
+        if not calls:
+            return out.get("content", "").strip(), history
+        for c in calls:
+            f = c.get("function", {}); name = f.get("name", ""); args = f.get("arguments") or {}
+            if isinstance(args, str):
+                try: args = json.loads(args)
+                except ValueError: args = {}
+            try:
+                result = tools[name][0](**args) if name in tools else f"no tool named {name}"
+            except Exception as e:  # report tool errors to the model, like a shell would
+                result = f"error: {e}"
+            if os.environ.get("SUBHUB_OLLAMA_VERBOSE"):
+                print(f"· {name} {json.dumps(args)[:120]}", file=sys.stderr)
+            history.append({"role": "tool", "tool_name": name, "content": str(result)[:30000]})
+    return "Stopped after %d steps without a final answer." % MAX_STEPS, history
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__); return 0
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "caps":
+        cmd_caps(); return 0
+    model = None
+    if "--model" in rest:
+        i = rest.index("--model"); model = rest[i + 1]; del rest[i:i + 2]
+    if not model:
+        raise SystemExit("subhub-ollama: --model is required")
+    task = " ".join(rest)
+    if cmd == "run":
+        if not sys.stdin.isatty():
+            extra = sys.stdin.read()
+            if extra.strip():
+                task = (task + "\n\n" + extra) if task else extra
+        answer, _ = agent(model, task, driver=False)
+        print(answer); return 0 if answer else 4
+    if cmd == "chat":
+        if task:
+            answer, _ = agent(model, task, driver=True); print(answer); return 0
+        history = None
+        print(f"Local agent on {model}. It can hand work to your subs. Ctrl-D to quit.", file=sys.stderr)
+        while True:
+            try:
+                line = input("> ")
+            except EOFError:
+                return 0
+            if line.strip():
+                answer, history = agent(model, line, driver=True, history=history)
+                print(answer)
+    raise SystemExit(f"subhub-ollama: unknown command {cmd}")
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

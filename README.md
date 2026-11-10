@@ -75,6 +75,23 @@ To add another Claude account or organization: `subhub signin claude --new --ema
 - **SubHub never starts, downloads or signs in to anything by itself.** It never starts Ollama and never downloads a model.
 - **There's a loop guard,** so a sub can't delegate further, and every run has a 30-minute timeout.
 
+## Ollama
+
+SubHub talks to Ollama's API (`OLLAMA_HOST`, local or remote). It doesn't use `ollama run`. It reads each model's capabilities from `/api/show` and uses everything the model supports:
+
+| Model reports | SubHub does |
+|---|---|
+| `tools` | Runs the model as a full agent: read/write files, list folders, run commands, plus Ollama `web_search`/`web_fetch` when `OLLAMA_API_KEY` is set |
+| `vision` | Attaches image files named in the brief |
+| `audio` | Transcribes `.wav` files named in the brief (`/v1/audio/transcriptions`) |
+| `thinking` | Turns thinking on (`SUBHUB_OLLAMA_THINK=low\|medium\|high\|false` to change it); only the answer is returned |
+| context length | Raises `num_ctx` to the model's maximum, capped by `SUBHUB_OLLAMA_CTX` (default 65536); Ollama's default is much smaller |
+| cloud (`:cloud`) | Lists and uses it through your signed-in Ollama server |
+
+**Ollama using your other subs:** `subhub ollama [--model M] [task]` runs a local model as an agent with two extra tools, `subhub_list` and `subhub_ask`, so it can hand work to Claude, Codex, Gemini and the rest. Without a task it opens a chat. You can also run Claude Code or Codex on an Ollama model (`ollama launch claude`, `ollama launch codex`). They already have the SubHub plugin.
+
+SubHub never starts Ollama or downloads models. The Ollama runner (`bin/subhub-ollama`) needs `python3`. Without it, Ollama falls back to `ollama run` and is text only.
+
 ## Settings
 
 `~/.subhub/config.json` holds, per sub: on/off, what it's for, its default model, and notes added to every brief. A top-level `order` sets the order agents try subs in. Ask your agent to "change my SubHub settings" (the `subhub-config` skill), or run:

@@ -1,6 +1,6 @@
 ---
 name: subhub
-description: Hand work to the user's other AI subscriptions (other Claude accounts, Codex, Cursor, Antigravity/Gemini, local Ollama) through SubHub. Each sub is a full agent that can read and edit files, run commands and research. Use for side or parallel work, a second-opinion review from another model family, very long documents or PDFs, web research, bulk or private work, or after a usage-limit error. Use it instead of running claude, codex, agy or cursor-agent yourself.
+description: Hand work to the user's other AI subscriptions (other Claude accounts, Codex, Cursor, Antigravity/Gemini, Ollama local or cloud models) through SubHub. Each sub is a full agent that can read and edit files, run commands and research. Use for side or parallel work, a second-opinion review from another model family, very long documents or PDFs, web research, bulk or private work, or after a usage-limit error. Use it instead of running claude, codex, agy or cursor-agent yourself.
 allowed-tools: Bash(subhub *)
 ---
 
@@ -28,7 +28,7 @@ To run in another folder (a git worktree you made for it): `subhub ask --in <fol
 - Subs have full access and no approval prompts: they edit real files and run commands in the folder they run in. Say in the brief what the sub may change ("report only, don't edit", "edit only src/auth.ts").
 - Don't give two subs, or a sub and yourself, the same files at the same time. For parallel edits use separate files or worktrees with `--in`.
 - Hold subs to your own rules: anything you'd ask the user about first (pushing, deploying, deleting, sending messages, spending money) needs the user's OK before you brief a sub to do it.
-- The brief must stand on its own: goal, file paths, what it may change, output format. The sub can't ask questions. Keep it under 10,000 characters; point to files by path. For Ollama, which can't open files, pass the brief as the 3rd argument in quotes and add `< file`.
+- The brief must stand on its own: goal, file paths, what it may change, output format. The sub can't ask questions. Keep it under 10,000 characters; point to files by path. Ollama subs depend on the model (see its Models line): a model with tools is a full agent; vision models read image files named in the brief by full path; audio models get .wav files named in the brief transcribed; a text-only model can't open files, so pass the brief as the 3rd argument in quotes and add `< file`.
 - Never put secrets, keys or .env contents in a brief: briefs go to other vendors.
 - Run `subhub ask` as the whole command, nothing chained after it. Allow it up to 10 minutes; if it moves to the background, wait for it instead of polling. It needs the network: run it outside any sandbox.
 - After a run in a git repo, SubHub lists the files that changed. Review the diff before telling the user the work is done.

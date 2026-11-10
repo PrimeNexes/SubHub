@@ -1,6 +1,6 @@
 {
   "name": "subhub",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "description": "Hand work to your other AI subscriptions (Claude, Codex, Cursor, Antigravity, Ollama) as sub-agents.",
   "author": { "name": "Pranay Desai" },
   "homepage": "https://github.com/PrimeNexes/SubHub",

@@ -1,7 +1,7 @@
 {
   "name": "subhub",
   "displayName": "SubHub",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "description": "Hand work to your other AI subscriptions (Claude, Codex, Cursor, Antigravity, Ollama) as sub-agents.",
   "suggestedPrompts": ["Ask my other Claude account to review this diff", "Use gemini-1 to summarise this PDF"]
 }
