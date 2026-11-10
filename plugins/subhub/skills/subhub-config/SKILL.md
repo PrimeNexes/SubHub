@@ -31,3 +31,4 @@ Changes apply on the next `subhub ask` call.
 - Add another Claude account or organization (for example the team side of an email): `subhub signin claude --new --email you@company.com`, then pick the organization in the browser.
 - Stop using a sub: `subhub remove <sub>`
 - Connect or disconnect an agent: `subhub connect <claude|codex|gemini|cursor|all>`, `subhub disconnect …`
+- Connecting also adds a short always-on rule (between `<!-- subhub:start` and `<!-- subhub:end -->`) to that agent's global rules file, so it uses subs before built-in sub-agents: `~/.claude/CLAUDE.md`, Codex's `AGENTS.md`, `~/.gemini/config/AGENTS.md`; Cursor has none. `subhub status` shows where. To connect without it: `subhub connect <agent> --no-rules`. To remove it: `subhub disconnect <agent>`, or delete the marked lines. Don't edit inside the markers: the next connect replaces them.

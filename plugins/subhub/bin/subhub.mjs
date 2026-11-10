@@ -7,8 +7,9 @@
 //   subhub models <sub>                every model that sub offers
 //   subhub ask [--in <folder>] <sub> <model|default> [brief | --brief-file <file> | brief on stdin]
 //   subhub status [--json] [--refresh] subs, agents and found accounts (the app reads --json)
-//   subhub install                     put subhub on PATH and connect every installed agent
-//   subhub connect|disconnect <agent|all>   claude, codex, gemini (Antigravity), cursor
+//   subhub install [--no-rules]        put subhub on PATH and connect every installed agent
+//   subhub connect|disconnect <agent|all> [--no-rules]   claude, codex, gemini (Antigravity), cursor
+//                                      (connect adds an always-on rule to the agent's global rules file; SUBHUB_NO_RULES=1 skips it)
 //   subhub signin <sub> | signin claude --new [--email you@x.com] [--sso]   sign an account in (interactive)
 //   subhub remove <sub> · subhub on|off <sub> · subhub config · subhub refresh · subhub version
 //   subhub ollama [--model M] [task]   a local Ollama model as an agent that can use your other subs
@@ -22,7 +23,7 @@ import crypto from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-const VERSION = "1.2.0";
+const VERSION = "1.3.0";
 const WIN = process.platform === "win32", MAC = process.platform === "darwin";
 const HOME = os.homedir();
 const SH = path.join(HOME, ".subhub"), REG = path.join(SH, "registry.json"), CFG = path.join(SH, "config.json");
@@ -312,14 +313,14 @@ function found(reg) {
 }
 async function cmdStatus(args) {
   const reg = await fresh(args.includes("--refresh"));
-  const agents = AGENTS.map((a) => ({ id: a, name: AGENT_NAME[a], installed: !!binFor(a), connected: agentOn(a) }));
+  const agents = AGENTS.map((a) => ({ id: a, name: AGENT_NAME[a], installed: !!binFor(a), connected: agentOn(a), rules: !!rulesIn(a), rulesFile: rulesIn(a) || RULE_FILES[a]()[0] || null }));
   const f = found(reg);
   if (args.includes("--json")) {
     console.log(JSON.stringify({ version: VERSION, subs: reg.subs.map((s) => ({ name: s.name, provider: s.provider, folder: s.dir, email: s.email, label: s.label, state: s.state, on: isOn(s.name) })), agents, found: f }));
     return;
   }
   console.log("Subs:"); for (const s of reg.subs) console.log(`  ${s.name.padEnd(10)} ${s.email.padEnd(28)} ${s.label.padEnd(26)} ${isOn(s.name) ? s.state : "off"}`);
-  console.log("Agents:"); for (const a of agents) console.log(`  ${a.name.padEnd(12)} ${!a.installed ? "not installed" : a.connected ? "connected" : `not connected (subhub connect ${a.id})`}`);
+  console.log("Agents:"); for (const a of agents) console.log(`  ${a.name.padEnd(12)} ${!a.installed ? "not installed" : a.connected ? "connected" : `not connected (subhub connect ${a.id})`}${a.rules ? `, always-on rule in ${a.rulesFile}` : ""}`);
   if (f.length) { console.log("Found, not signed in (subhub signin claude --new --email <email>):"); for (const x of f) console.log(`  ${x.email} · ${["team", "enterprise"].includes(x.type) ? "Team " + x.orgName : "Personal"}`); }
 }
 
@@ -558,9 +559,61 @@ function allow(add, file, rule) {
   o.permissions.allow = add ? [...o.permissions.allow, rule] : o.permissions.allow.filter((r) => r !== rule);
   writeJSON(file, o);
 }
+// The always-on rule: a marked block in each agent's global instructions file, so the agent uses subs by default.
+// Claude Code ~/.claude/CLAUDE.md · Codex <CODEX_HOME>/AGENTS.md (AGENTS.override.md if that's the one Codex reads)
+// · Antigravity ~/.gemini/config/AGENTS.md (~/.gemini/GEMINI.md is shared with Gemini CLI) · Cursor: none (no per-user rules file).
+const RULE_START = "<!-- subhub:start", RULE_END = "<!-- subhub:end -->", RULE_STATE = path.join(SH, "rules.json");
+const RULE_BLOCK = [`${RULE_START} v${VERSION}: written by SubHub, removed by subhub disconnect -->`,
+  "## Use the user's other AI subscriptions (SubHub) first",
+  "- Before starting a built-in sub-agent, or doing delegable side work (wide file reads, research, reviews, independent edits, parallel pieces), run `subhub list` and hand the work to a ready sub with `subhub ask` (details in the subhub skill). This saves this account's usage.",
+  "- Do it yourself or with built-in sub-agents only when `subhub list` shows no ready sub, the task is a few tool calls, the work needs this conversation's context that can't be put in a brief, or the brief would have to contain secrets.",
+  "- If you are running as a sub yourself (the brief says you are a sub-agent, or SUBHUB_DEPTH is set), don't delegate.",
+  "- Run `subhub` as the whole command, with nothing chained before or after it.",
+  RULE_END];
+const nonEmpty = (f) => { try { return fs.readFileSync(f, "utf8").trim() !== ""; } catch { return false; } };
+const RULE_FILES = {   // every file SubHub may have put the block in; the first is where connect writes it
+  claude: () => [path.join(HOME, ".claude", "CLAUDE.md")],
+  codex: () => { const o = path.join(codexHome(), "AGENTS.override.md"), a = path.join(codexHome(), "AGENTS.md"); return nonEmpty(o) ? [o, a] : [a, o]; },
+  gemini: () => [path.join(HOME, ".gemini", "config", "AGENTS.md")],
+  cursor: () => [],
+};
+/** Where the block is: [start, end) of the block itself, or null. */
+function findBlock(text) {
+  const s = text.indexOf(RULE_START); if (s < 0) return null;
+  const e = text.indexOf(RULE_END, s); return e < 0 ? null : [s, e + RULE_END.length];
+}
+const readText = (f) => { try { return fs.readFileSync(f, "utf8"); } catch { return null; } };
+const rulesIn = (a) => RULE_FILES[a]().find((f) => findBlock(readText(f) || "")) || null;
+/** Writes (or refreshes in place) the block. Everything else in the file stays byte for byte; writes through symlinks. */
+function addRules(file) {
+  const old = readText(file), text = old ?? "", eol = text.includes("\r\n") ? "\r\n" : "\n", block = RULE_BLOCK.join(eol), at = findBlock(text);
+  let next;
+  if (at) next = text.slice(0, at[0]) + block + text.slice(at[1]);
+  else {
+    const before = !text ? "" : /\r?\n$/.test(text) ? eol : eol + eol;
+    next = text + before + block + eol;
+    const st = readJSON(RULE_STATE) || {}; st[file] = { created: old === null, before }; writeJSON(RULE_STATE, st);
+  }
+  if (next === text) return;
+  if (old !== null && !pexist(file + ".subhub-backup")) fs.copyFileSync(file, file + ".subhub-backup");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, next);   // an existing file keeps its mode, and a symlink stays a symlink
+}
+/** Removes the block and the separator SubHub added; deletes the file only if SubHub created it and it's now empty. */
+function removeRules(file) {
+  const text = readText(file); if (text === null) return;
+  const at = findBlock(text); if (!at) return;
+  const st = readJSON(RULE_STATE) || {}, rec = st[file] || { created: !pexist(file + ".subhub-backup"), before: null };
+  let head = text.slice(0, at[0]), tail = text.slice(at[1]).replace(/^\r?\n/, "");
+  if (rec.before === null) { const m = head.match(/(\r?\n)\1$/); if (m && /\S/.test(head)) head = head.slice(0, -m[1].length); }   // no record: undo a usual blank line
+  else if (rec.before && head.endsWith(rec.before)) head = head.slice(0, -rec.before.length);
+  const next = head + tail;
+  if (!next && rec.created) fs.rmSync(file, { force: true }); else fs.writeFileSync(file, next);
+  delete st[file]; writeJSON(RULE_STATE, st);
+}
 const copyDir = (from, to) => { fs.rmSync(to, { recursive: true, force: true }); fs.cpSync(from, to, { recursive: true }); };
 const quiet = (bin, args) => run(bin, args, { timeout: 180000 }).code === 0;
-function connect(a) {
+function connect(a, rules = !process.env.SUBHUB_NO_RULES) {
   const b = binFor(a); if (!b) { console.log(`  ${AGENT_NAME[a]}: not installed, skipped`); return; }
   const market = process.env.SUBHUB_MARKET || process.env.SUBHUB_REPO || path.resolve(SRC, "..", "..");
   if (a === "claude") {
@@ -582,7 +635,11 @@ function connect(a) {
     copyDir(path.join(SRC, "skills", "subhub"), SKILL_DIR.cursor());
     for (const r of RULES()) allow(true, path.join(HOME, ".cursor", "cli-config.json"), `Shell(${r})`);
   }
-  console.log(`  ${AGENT_NAME[a]}: connected`);
+  let note = "";
+  if (!RULE_FILES[a]().length) note = "; no global rules file to write the always-on rule to (skill only)";
+  else if (rules) { const f = RULE_FILES[a]()[0]; addRules(f); note = `; always-on rule in ${f}`; }
+  else note = "; always-on rule skipped";
+  console.log(`  ${AGENT_NAME[a]}: connected${note}`);
 }
 function disconnect(a) {
   const b = binFor(a);
@@ -600,6 +657,7 @@ function disconnect(a) {
     fs.rmSync(SKILL_DIR.cursor(), { recursive: true, force: true });
     for (const r of RULES()) allow(false, path.join(HOME, ".cursor", "cli-config.json"), `Shell(${r})`);
   }
+  for (const f of RULE_FILES[a]()) removeRules(f);
   console.log(`  ${AGENT_NAME[a]}: disconnected`);
 }
 
@@ -617,7 +675,7 @@ function migrate() {
   for (const d of ["models", "run"]) fs.rmSync(path.join(SH, d), { recursive: true, force: true });
   if (!WIN) { fs.writeFileSync(old, `#!/bin/sh\n# Old name for subhub, kept so older sessions keep working.\ncase $1 in --list) exec "${launcher()}" list ;; --models) exec "${launcher()}" models "$2" ;; esac\nexec "${launcher()}" ask "$@"\n`); fs.chmodSync(old, 0o755); }
 }
-async function cmdInstall() {
+async function cmdInstall(rules) {
   fs.mkdirSync(BIN, { recursive: true });
   fs.copyFileSync(SELF, path.join(BIN, "subhub.mjs"));
   if (WIN) {
@@ -639,7 +697,7 @@ async function cmdInstall() {
   console.log("Finding your AI accounts…");
   const reg = await refresh();
   for (const s of reg.subs) console.log(`  ${s.name.padEnd(10)} ${s.email} · ${s.label} (${s.state})`);
-  console.log("Connecting agents…"); for (const a of AGENTS) connect(a);
+  console.log("Connecting agents…"); for (const a of AGENTS) connect(a, rules);
   console.log("Done. Start a new session in any connected agent and ask it to use your subs.");
 }
 async function cmdSignin(args) {
@@ -674,21 +732,23 @@ function cmdOnOff(on, name) {
 
 // ---------------------------------------------------------------- main
 const [cmd, ...rest] = process.argv.slice(2);
-const target = (x) => (x === "all" || !x ? AGENTS : [x]);
+const flags = rest.filter((x) => x.startsWith("--")), words = rest.filter((x) => !x.startsWith("--"));
+const withRules = !flags.includes("--no-rules") && !process.env.SUBHUB_NO_RULES;
+const target = (x) => (x === "all" || !x ? AGENTS : AGENTS.includes(x) ? [x] : die(2, `unknown agent '${x}': claude, codex, gemini, cursor or all.`));
 switch (cmd) {
   case "list": await cmdList(rest.includes("--refresh")); break;
   case "models": await cmdModels(rest[0]); break;
   case "ask": await cmdAsk(rest); break;
   case "status": await cmdStatus(rest); break;
   case "refresh": await refresh(); console.log("Refreshed."); break;
-  case "install": await cmdInstall(); break;
-  case "connect": for (const a of target(rest[0])) connect(a); break;
-  case "disconnect": for (const a of target(rest[0])) disconnect(a); break;
+  case "install": await cmdInstall(withRules); break;
+  case "connect": for (const a of target(words[0])) connect(a, withRules); break;
+  case "disconnect": for (const a of target(words[0])) disconnect(a); break;
   case "signin": await cmdSignin(rest); break;
   case "remove": cmdRemove(rest[0]); break;
   case "on": case "off": cmdOnOff(cmd === "on", rest[0]); break;
   case "config": console.log(`${CFG}:\n` + (pexist(CFG) ? fs.readFileSync(CFG, "utf8") : '(none yet: {"subs":{"<sub>":{"on":true,"use_for":"","model":"default","notes":""}},"order":[]})')); break;
   case "ollama": await cmdOllama(rest); break;
   case "version": case "--version": console.log(`subhub ${VERSION}`); break;
-  default: console.log(fs.readFileSync(SELF, "utf8").split("\n").slice(1, 17).map((l) => l.replace(/^\/\/ ?/, "")).join("\n"));
+  default: console.log(fs.readFileSync(SELF, "utf8").split("\n").slice(1, 18).map((l) => l.replace(/^\/\/ ?/, "")).join("\n"));
 }

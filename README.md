@@ -26,11 +26,29 @@ irm https://raw.githubusercontent.com/PrimeNexes/SubHub/main/install.ps1 | iex
 
 Both need [Node.js](https://nodejs.org) 18 or newer. On Windows, `winget install OpenJS.NodeJS.LTS` installs it.
 
-`subhub install` does four things:
+`subhub install` does five things:
 - puts `subhub` in `~/.local/bin`
 - finds every AI account you're signed in to
 - installs the plugin into each agent that's installed
 - adds one permission rule per agent, so the agent can run `subhub` without asking
+- adds a short always-on rule to each agent's global rules file (see below), and prints which file it wrote
+
+### Always-on rule
+
+A skill only loads when the agent decides a task matches it, so agents often fall back to their built-in sub-agents and spend the calling account's usage. To make subs the default, `subhub connect` (and so `subhub install`) adds a block of about six lines to the agent's global, all-projects rules file. The block tells the agent to run `subhub list` and hand delegable work to a ready sub before starting a built-in sub-agent, except for tiny tasks, work that needs the conversation's context, briefs that would contain secrets, or when it is itself a sub.
+
+| Agent | File |
+|---|---|
+| Claude Code | `~/.claude/CLAUDE.md` |
+| Codex | `AGENTS.md` in `CODEX_HOME` (default `~/.codex`); `AGENTS.override.md` there instead if you have a non-empty one, since Codex then reads only that |
+| Antigravity | `~/.gemini/config/AGENTS.md` (not `~/.gemini/GEMINI.md`, which Gemini CLI also reads) |
+| Cursor | none: Cursor's User Rules live in its settings, not in a file the CLI reads, so Cursor gets the skill only |
+
+The block sits between `<!-- subhub:start … -->` and `<!-- subhub:end -->`. SubHub never touches anything outside those lines; connecting again refreshes the block in place. The first time it changes an existing file, SubHub saves a copy as `<file>.subhub-backup`.
+
+- **Skip it:** `subhub connect <agent> --no-rules`, `subhub install --no-rules`, or `SUBHUB_NO_RULES=1` for the one-line installers (`curl -fsSL …/install.sh | SUBHUB_NO_RULES=1 sh`, or `$env:SUBHUB_NO_RULES=1` before `irm … | iex`).
+- **Remove it:** `subhub disconnect <agent>` takes the block out and leaves the rest of the file as it was (a file SubHub created is deleted). Or delete the marked lines yourself.
+- `subhub status` shows which agents have the rule.
 
 Or install the plugin through each agent's own plugin manager:
 
@@ -109,7 +127,7 @@ SubHub never starts Ollama or downloads models.
 ```sh
 subhub on|off <sub>
 subhub remove <sub>
-subhub connect|disconnect <claude|codex|gemini|cursor|all>
+subhub connect|disconnect <claude|codex|gemini|cursor|all> [--no-rules]
 ```
 
 ## Repo layout

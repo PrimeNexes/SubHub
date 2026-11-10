@@ -157,8 +157,38 @@ chats.length = 0; await sh(["ask", "ollama-1", "agent:8b", "x\nhi"], { env: { OL
 r = await sh(["ollama", "--model", "agent:8b", "HANDOFF to a sub"]); ok(r.out.includes("DONE subhub_ask") && r.out.includes("gemini ran"), "subhub ollama: a local model hands work to another sub", r.out + r.err);
 r = await sh(["ask", "ollama-1", "nope:1b", "hi"]); ok(r.code === 7, "model that isn't installed refused (exit 7)");
 
-// 6. agents: connect and disconnect
+// 6. agents: connect and disconnect (with the always-on rule in each agent's global rules file)
+const CMD = path.join(H, ".claude", "CLAUDE.md"), AMD = path.join(H, ".codex", "AGENTS.md"), GMD = path.join(H, ".gemini", "config", "AGENTS.md");
+const CMD0 = "# My rules\n\nUse tabs.", AMD0 = "# Codex rules\r\n\r\nBe brief.\r\n";
+mk(CMD, CMD0);
+let amdReal = AMD;
+if (!WIN) { amdReal = path.join(H, "dotfiles", "AGENTS.md"); mk(amdReal, AMD0); fs.chmodSync(amdReal, 0o640); fs.symlinkSync(amdReal, AMD); } else mk(AMD, AMD0);
+const read = (f) => { try { return fs.readFileSync(f, "utf8"); } catch { return null; } };
+const blocks = (t) => (t || "").split("<!-- subhub:start").length - 1;
+r = await sh(["connect", "all", "--no-rules"]);
+ok(read(CMD) === CMD0 && read(AMD) === AMD0 && !fs.existsSync(GMD) && !fs.existsSync(CMD + ".subhub-backup"), "connect --no-rules writes no rule", r.out + r.err);
+r = await sh(["connect", "claude"], { env: { SUBHUB_NO_RULES: "1" } }); ok(read(CMD) === CMD0, "SUBHUB_NO_RULES=1 writes no rule");
 r = await sh(["connect", "all"]);
+ok(r.out.includes(`always-on rule in ${CMD}`) && r.out.includes(`always-on rule in ${GMD}`) && /Cursor: connected; no global rules file/.test(r.out), "connect says which file has the rule", r.out);
+for (const [f, orig, name] of [[CMD, CMD0, "Claude Code"], [AMD, AMD0, "Codex"]]) {
+  const t = read(f) || "";
+  ok(t.startsWith(orig) && blocks(t) === 1 && t.includes("run `subhub list`") && t.trimEnd().endsWith("<!-- subhub:end -->"), `${name}: rule added after the existing content`, JSON.stringify(t.slice(0, 120)));
+  ok(read(f + ".subhub-backup") === orig, `${name}: original backed up`);
+}
+ok(/\r\n<!-- subhub:start[^\n]*\r\n## /.test(read(AMD)), "Codex: CRLF file gets CRLF lines");
+if (!WIN) ok(fs.lstatSync(AMD).isSymbolicLink() && (fs.statSync(amdReal).mode & 0o777) === 0o640, "symlinked rules file stays a symlink, mode kept");
+ok(blocks(read(GMD)) === 1 && read(GMD).startsWith("<!-- subhub:start") && !fs.existsSync(GMD + ".subhub-backup"), "Antigravity: missing rules file created, no backup");
+ok(!fs.existsSync(path.join(H, ".cursor", "AGENTS.md")) && !fs.readdirSync(path.join(H, ".cursor")).some((f) => /\.md$/i.test(f)), "Cursor: no rules file written");
+await sh(["connect", "claude"]); ok(blocks(read(CMD)) === 1 && read(CMD).startsWith(CMD0), "second connect leaves one block");
+fs.writeFileSync(CMD, read(CMD).replace(/<!-- subhub:start[\s\S]*?<!-- subhub:end -->/, "<!-- subhub:start v1.0.0 -->\nold text\n<!-- subhub:end -->") + "after\n");
+await sh(["connect", "claude"]); let t = read(CMD);
+ok(blocks(t) === 1 && !t.includes("old text") && t.includes("SUBHUB_DEPTH") && t.startsWith(CMD0) && t.endsWith("<!-- subhub:end -->\nafter\n"), "older block replaced in place", JSON.stringify(t));
+fs.writeFileSync(CMD, t.replace(/after\n$/, ""));
+r = await sh(["status", "--json"]); st = JSON.parse(r.out);
+const ag = Object.fromEntries(st.agents.map((a) => [a.id, a]));
+ok(ag.claude.rules === true && ag.claude.rulesFile === CMD && ag.codex.rules && ag.gemini.rules && ag.cursor.rules === false && ag.cursor.rulesFile === null && "connected" in ag.claude, "status --json reports the rule per agent", JSON.stringify(st.agents));
+r = await sh(["status"]); ok(r.out.includes(`always-on rule in ${CMD}`), "status shows the rule file");
+
 const cur = JSON.parse(fs.readFileSync(path.join(H, ".cursor", "cli-config.json"), "utf8"));
 ok(fs.existsSync(path.join(H, ".claude", "skills", "subhub", "skills", "subhub", "SKILL.md")) && JSON.parse(fs.readFileSync(path.join(H, ".claude", "settings.json"), "utf8")).permissions.allow.includes("Bash(subhub *)"), "Claude Code connected (plugin + rule)");
 ok(fs.existsSync(path.join(H, ".codex", "skills", "subhub", "SKILL.md")) && fs.readFileSync(path.join(H, ".codex", "rules", "subhub.rules"), "utf8").includes('prefix_rule(pattern = ["subhub"]'), "Codex connected (skill + rule)");
@@ -167,10 +197,17 @@ ok(cur.permissions.allow.includes("Shell(ls)") && cur.permissions.allow.includes
 await sh(["disconnect", "all"]);
 const cur2 = JSON.parse(fs.readFileSync(path.join(H, ".cursor", "cli-config.json"), "utf8"));
 ok(cur2.permissions.allow.join() === "Shell(ls)" && !fs.existsSync(path.join(H, ".cursor", "skills", "subhub")) && !fs.existsSync(path.join(H, ".codex", "rules", "subhub.rules")), "disconnect removes exactly what was added");
+ok(read(CMD) === CMD0 && read(AMD) === AMD0, "disconnect restores the rules files byte for byte", JSON.stringify([read(CMD), read(AMD)]));
+ok(!fs.existsSync(GMD), "disconnect removes the rules file SubHub created");
+if (!WIN) ok(fs.lstatSync(AMD).isSymbolicLink(), "symlink still a symlink after disconnect");
+r = await sh(["status", "--json"]); ok(JSON.parse(r.out).agents.every((a) => a.rules === false), "status: no rule after disconnect");
 
 // 7. install and remove
 r = await sh(["install"], { env: { SUBHUB_REPO: ROOT } });
 ok(fs.existsSync(path.join(H, ".subhub", "bin", "subhub.mjs")) && fs.existsSync(path.join(H, ".subhub", "bin", WIN ? "subhub.cmd" : "subhub")), "install puts the engine and launcher in ~/.subhub/bin", r.out + r.err);
+ok(r.out.includes(`always-on rule in ${CMD}`) && blocks(read(CMD)) === 1, "install writes the rule and says where", r.out);
+await sh(["disconnect", "all"]); r = await sh(["install"], { env: { SUBHUB_REPO: ROOT, SUBHUB_NO_RULES: "1" } });
+ok(read(CMD) === CMD0 && !fs.existsSync(GMD) && r.out.includes("always-on rule skipped"), "SUBHUB_NO_RULES=1 install writes no rule", r.out);
 if (!WIN) { const l = spawnSync(path.join(H, ".local", "bin", "subhub"), ["version"], { env: baseEnv, encoding: "utf8" }); ok(/subhub \d/.test(l.stdout), "~/.local/bin/subhub runs", l.stderr); }
 else { const l = spawnSync("cmd.exe", ["/d", "/c", path.join(H, ".subhub", "bin", "subhub.cmd"), "version"], { env: baseEnv, encoding: "utf8" }); ok(/subhub \d/.test(l.stdout), "subhub.cmd runs", l.stderr); }
 const team = Object.values(subs).find((s) => /Acme/.test(s.label)).name;
