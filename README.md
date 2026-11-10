@@ -15,7 +15,7 @@ You pay for several AI subscriptions: a second Claude account, a team and a pers
 - parallel side work
 - carrying on after a usage limit
 
-SubHub is a plugin with two skills, for Claude Code, Codex and Antigravity, and for Cursor through its skills folder. It runs on **macOS, Linux and Windows**. One Node.js file, `subhub.mjs`, does the work, using only Node's built-in modules. There's no server and no background process.
+SubHub is a plugin with two skills, for Claude Code, Codex and Antigravity, and for Cursor through its skills folder. It runs on **macOS, Linux and Windows**. One Node.js file, `subhub.mjs`, does the work, using only Node's built-in modules. There's no server and no daemon: state is plain files in `~/.subhub`, and a background job is one process that ends with the job.
 
 ## Install
 
@@ -85,6 +85,35 @@ subhub ask <sub> <model|default> <<'SUBHUB_BRIEF_END'
 SUBHUB_BRIEF_END
 ```
 
+## Jobs, progress and follow-ups
+
+Every `subhub ask` is a job with a short id, kept in `~/.subhub/jobs/<id>/` for 7 days: its metadata (sub, model, folder, times, state, exit code, the sub CLI's session id), the brief, a progress log, raw output and the final answer. A foreground ask still prints only the answer; one stderr line names the job.
+
+| Command | Does |
+|---|---|
+| `subhub ask --bg gemini-1 default <<'SUBHUB_BRIEF_END'` … | starts the job in the background and prints its id at once |
+| `subhub job wait 3f9a2c 600` | waits up to 600 seconds, then prints the answer (or the status, exit 14, if it's still running) |
+| `subhub job 3f9a2c` | state, elapsed time, time since the last activity, the last progress lines, whether it can be continued |
+| `subhub job tail 3f9a2c 40` | the last 40 progress lines |
+| `subhub job result 3f9a2c` | the answer and the files that changed |
+| `subhub job stop 3f9a2c` | stops it and everything it started |
+| `subhub jobs` | running and recent jobs (`--json` for scripts) |
+| `subhub ask --continue 3f9a2c "Now add tests"` | a follow-up in the same conversation: same sub, account and folder (`--model` to switch model, `--bg` works too) |
+
+**Progress.** SubHub runs each CLI in its documented streaming mode and turns the events into short timestamped lines (commands, file edits, what the agent says, errors):
+
+| Sub | Stream | Continue |
+|---|---|---|
+| Claude Code | `claude -p --output-format stream-json --verbose` | `--resume <session_id>` |
+| Codex | `codex exec --json` | `codex exec resume <thread_id>` |
+| Cursor | `cursor-agent -p --output-format stream-json` | `--resume <session_id>` |
+| Antigravity | `agy -p --output-format stream-json` | `--conversation <conversation_id>` |
+| Ollama | SubHub's own agent loop logs each step and tool call | the conversation saved in the job folder |
+
+SubHub checks each CLI's `--help` for these flags; a CLI without them, or a stream it can't read, runs in plain mode as before (stdout is the answer, stderr lines are the progress). A job can be continued after it finishes, times out, stalls or is stopped, as long as a session id was captured; otherwise `--continue` fails with exit 11 instead of starting fresh. A job whose runner died (reboot, kill) shows as interrupted.
+
+**Stalls.** Every brief tells the sub to run commands in the foreground and never leave background tasks running, because nobody collects them in a headless run (Claude subs also run with `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`). If a sub shows no activity for 15 minutes (`SUBHUB_IDLE` seconds, `0` turns it off), SubHub stops it as stalled (exit 12); a line that only repeats, like `waiting for 1 background task(s) to finish`, doesn't count as activity. 15 minutes is longer than one long command: Claude Code's Bash tool stops a command at 10 minutes. `SUBHUB_PLAIN=1` turns streaming off.
+
 ## Accounts
 
 `subhub status` shows every sub, every agent, and accounts found on this computer that aren't signed in yet.
@@ -106,7 +135,7 @@ To add another Claude account or organization: `subhub signin claude --new --ema
 - **Subs use their own sign-in, never the caller's.** SubHub drops the caller's session and token variables before starting a sub.
 - **Subs run with full access, in the folder you call from.** The calling agent says in the brief what each sub may change. After each run in a git repo, SubHub lists the files that changed.
 - **SubHub never starts, downloads or signs in to anything by itself.** It never starts Ollama and never downloads a model.
-- **There's a loop guard,** so a sub can't delegate further, and every run has a 30-minute timeout.
+- **There's a loop guard,** so a sub can't delegate further. Every run has a 30-minute timeout (`SUBHUB_TIMEOUT` seconds) and is stopped earlier if it shows no activity for 15 minutes (`SUBHUB_IDLE`); either way SubHub stops the sub's whole process tree, and the job can be continued with `subhub ask --continue <id>`.
 
 ## Ollama
 

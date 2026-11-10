@@ -5,7 +5,10 @@
 //
 //   subhub list [--refresh]            the subs, what each is for, its limits and models (agents read this)
 //   subhub models <sub>                every model that sub offers
-//   subhub ask [--in <folder>] <sub> <model|default> [brief | --brief-file <file> | brief on stdin]
+//   subhub ask [--bg] [--in <folder>] <sub> <model|default> [brief | --brief-file <file> | brief on stdin]
+//   subhub ask [--bg] --continue <job> [--model M] [brief]   a follow-up in the same sub conversation
+//   subhub jobs [--json] · subhub job <id> [--json] · subhub job tail <id> [n] · subhub job result <id>
+//   subhub job wait <id> [seconds] · subhub job stop <id>      every ask is a job in ~/.subhub/jobs/<id>/
 //   subhub status [--json] [--refresh] subs, agents and found accounts (--json for scripts)
 //   subhub install [--no-rules]        put subhub on PATH and connect every installed agent
 //   subhub connect|disconnect <agent|all> [--no-rules]   claude, codex, gemini (Antigravity), cursor
@@ -14,8 +17,9 @@
 //   subhub remove <sub> · subhub on|off <sub> · subhub config · subhub refresh · subhub version
 //   subhub ollama [--model M] [task]   a local Ollama model as an agent that can use your other subs
 //
-// ask exit codes: 0 answer · 2 bad sub, model or folder · 3 loop guard · 4 empty answer · 6 that sub is you
-// 7 not signed in / app not running · 8 turned off · 10 signed in as another account · 124 timeout · 127 CLI missing
+// ask exit codes: 0 answer · 2 bad sub, model, folder or job · 3 loop guard · 4 empty answer · 6 that sub is you
+// 7 not signed in / app not running · 8 turned off · 10 signed in as another account · 11 can't continue that job
+// 12 stalled (no activity for SUBHUB_IDLE seconds) · 13 stopped · 14 still running (job wait/result) · 124 timeout · 127 CLI missing
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -23,15 +27,15 @@ import crypto from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-const VERSION = "0.3.0-alpha";
+const VERSION = "0.4.0-alpha";
 const WIN = process.platform === "win32", MAC = process.platform === "darwin";
 const HOME = os.homedir();
 const SH = path.join(HOME, ".subhub"), REG = path.join(SH, "registry.json"), CFG = path.join(SH, "config.json");
-const IGN = path.join(SH, "ignored"), CACHE = path.join(SH, "cache"), LOGS = path.join(SH, "logs"), BIN = path.join(SH, "bin");
+const IGN = path.join(SH, "ignored"), CACHE = path.join(SH, "cache"), JOBS = path.join(SH, "jobs"), BIN = path.join(SH, "bin");
 const SELF = fileURLToPath(import.meta.url);
 const SRC = path.resolve(path.dirname(SELF), "..");              // the plugin folder this file came with
 const PROVIDERS = ["claude", "codex", "cursor", "gemini", "ollama"];
-for (const d of [SH, CACHE, LOGS]) fs.mkdirSync(d, { recursive: true, mode: 0o700 });
+for (const d of [SH, CACHE, JOBS]) fs.mkdirSync(d, { recursive: true, mode: 0o700 });
 
 // ---------------------------------------------------------------- helpers
 const die = (code, msg) => { process.stderr.write(`SubHub: ${msg}\n`); process.exit(code); };
@@ -274,7 +278,8 @@ async function cmdList(force) {
     if (s.state === "stopped") { waiting.push(`${s.name} (Ollama isn't running)`); continue; }
     out.push(`| ${s.name} | ${s.email}, ${s.label} | ${pref(s.name, "use_for") || USE_FOR[s.provider]} | ${LIMITS[s.provider]} |`); ready.push(s);
   }
-  out.push("", "All subs start fresh (no memory of your conversation), run headless (they can't ask questions), with full access and no approval prompts, in the folder you call from (or `--in <folder>`), for up to 30 minutes.",
+  out.push("", "All subs start fresh (no memory of your conversation), run headless (they can't ask questions), with full access and no approval prompts, in the folder you call from (or `--in <folder>`), for up to 30 minutes (stopped early as stalled after 15 minutes with no activity).",
+    "", "Every ask is a job: `subhub ask --bg …` returns a job id at once; `subhub job wait <id>` collects it, `subhub job <id>` shows its progress, and `subhub ask --continue <id> <follow-up>` continues the same conversation (also after a timeout or stall).",
     "", "## Models", "", "Pass an id as the 2nd argument, or default. Quote ids with brackets.");
   let firstClaude = null;
   for (const s of ready) {
@@ -336,20 +341,33 @@ function gitSnap(cwd) {
   return crypto.createHash("sha1").update(st.out + run("git", ["diff"], { cwd }).out).digest("hex");
 }
 
+// Every brief gets this: in a headless run nobody collects background work, and the run would wait on it.
+const FOREGROUND = "Run every command in the foreground and wait for it to finish. Never start background tasks, background agents or processes that keep running (servers, watchers): nobody collects them in a headless run, and the run would hang.";
+const IDLE = 900;   // default SUBHUB_IDLE: longer than one long command (Claude's Bash tool caps a command at 10 minutes)
+
 async function cmdAsk(argv) {
-  const args = [...argv]; let briefFile = null;
-  if (args[0] === "--in") { try { process.chdir(expand(args[1])); } catch { die(2, `can't open the folder '${args[1]}'.`); } args.splice(0, 2); }
-  const bf = args.indexOf("--brief-file"); if (bf >= 0) { briefFile = args[bf + 1]; args.splice(bf, 2); }
+  const args = [...argv], opt = {};
+  for (const f of ["--in", "--brief-file", "--continue", "--model"]) { const i = args.indexOf(f); if (i >= 0) { opt[f] = args[i + 1]; args.splice(i, 2); } }
+  const bg = args.indexOf("--bg"); if (bg >= 0) args.splice(bg, 1);
+  let parent = null, name, model, task;
+  if (opt["--continue"]) {
+    parent = jload(opt["--continue"]) || die(2, `no job '${opt["--continue"]}'. subhub jobs lists them.`);
+    const w = whyNot(parent); if (w) die(11, `job ${parent.id} can't be continued: ${w}.`);
+    try { process.chdir(parent.folder); } catch { die(2, `can't open the folder '${parent.folder}' that job ${parent.id} ran in.`); }
+    [name, model, task = ""] = [parent.sub, opt["--model"] || parent.model, args[0]];
+  } else {
+    if (opt["--in"]) { try { process.chdir(expand(opt["--in"])); } catch { die(2, `can't open the folder '${opt["--in"]}'.`); } }
+    [name, model = "default", task = ""] = args; if (opt["--model"]) model = opt["--model"];
+  }
+  if (!task) task = opt["--brief-file"] ? fs.readFileSync(expand(opt["--brief-file"]), "utf8") : readStdin();
   // Who is calling: a Claude Code session says so in its environment. Any agent may call.
   const env = { ...process.env };
   const caller = env.CLAUDE_CODE_USER_EMAIL ? `${env.CLAUDE_CODE_USER_EMAIL.toLowerCase()}|${env.CLAUDE_CODE_ORGANIZATION_UUID || ""}` : "";
   const inClaude = !!env.CLAUDECODE, callerDir = env.CLAUDE_CONFIG_DIR || "";
   for (const v of CALLER_VARS) delete env[v];          // a sub uses its own sign-in, never the caller's
-  const timeout = (+env.SUBHUB_TIMEOUT || 1800) * 1000, max = +env.SUBHUB_MAX_DEPTH || 1, depth = +env.SUBHUB_DEPTH || 0;
+  const max = +env.SUBHUB_MAX_DEPTH || 1, depth = +env.SUBHUB_DEPTH || 0;
   if (depth >= max) die(3, `loop guard: depth ${max} reached`);
   env.SUBHUB_DEPTH = String(depth + 1);
-  let [name, model = "default", task = ""] = args;
-  if (!task) task = briefFile ? fs.readFileSync(expand(briefFile), "utf8") : readStdin();
   let reg = loadReg(), s = reg.subs.find((x) => x.name === name);
   if (!s) { reg = await refresh(); s = reg.subs.find((x) => x.name === name); }
   if (!s) die(2, `unknown sub '${name}'. subhub list shows them.`);
@@ -359,73 +377,331 @@ async function cmdAsk(argv) {
   if (s.state === "stopped") die(7, "Ollama isn't running. Start it yourself; SubHub never starts it.");
   if (model === "default" && pref(name, "model")) model = pref(name, "model");
   if (!/^[A-Za-z0-9._:/\[\]-]+$/.test(model)) die(2, `'${model}' isn't a model name.`);
-  const notes = pref(name, "notes");
-  let brief = `Task from another AI agent. You're its sub-agent, working in ${process.cwd()}. You run headless: nobody can answer questions, so make sensible choices and finish. If you change any files, list them at the end.\n${task}`;
-  if (notes) brief += `\n\nNotes from the user for this sub:\n${notes}`;
+  const cwd = process.cwd(), notes = pref(name, "notes");
+  let brief;
+  if (parent) brief = `Follow-up from the AI agent that gave you the task. Same folder (${cwd}); you still run headless, so nobody can answer questions. ${FOREGROUND}\n`
+    + (task.trim() || "Carry on with the task from where you stopped and finish it. If you change any files, list them at the end.");
+  else {
+    brief = `Task from another AI agent. You're its sub-agent, working in ${cwd}. You run headless: nobody can answer questions, so make sensible choices and finish. ${FOREGROUND} If you change any files, list them at the end.\n${task}`;
+    if (notes) brief += `\n\nNotes from the user for this sub:\n${notes}`;
+  }
   brief += "\n\nYou are a sub-agent. Do not delegate further.";
-  const before = gitSnap(process.cwd());
-  let answer = "", code = 0, logf = path.join(LOGS, `${name}.log`);
+  const idle = env.SUBHUB_IDLE !== undefined && env.SUBHUB_IDLE !== "" ? Math.max(0, +env.SUBHUB_IDLE || 0) : IDLE;
+  const job = { id: "", sub: name, provider: s.provider, model, folder: cwd, started: Date.now(), state: "running", code: null, pid: null,
+    session: parent?.session || null, resume: parent?.session || null, parent: parent?.id || null,
+    title: clip(task.split("\n").find((l) => l.trim()) || "(carry on)", 70), timeout: +env.SUBHUB_TIMEOUT || 1800, idle, bg: bg >= 0 };
   if (s.provider === "ollama") {
     if (model === "default") model = ollamaDefault(reg);
     if (!model) die(7, "Ollama has no models. Pull one yourself (ollama pull <model>); SubHub never downloads models.");
     const tags = await ollamaModels(); if (!tags) die(7, `Ollama isn't running at ${ollamaHost()}. Start it yourself; SubHub never starts it.`);
     if (!model.includes(":")) model += ":latest";
     if (!tags.some((m) => m.name === model)) die(7, `${model} isn't installed in Ollama, and SubHub won't download it.`);
-    process.env.SUBHUB_DEPTH = env.SUBHUB_DEPTH;
-    try { answer = (await withTimeout(ollamaAgent(model, brief, false), timeout)).answer; }
-    catch (e) { code = e.timeout ? 124 : 1; fs.appendFileSync(logf, String(e.message || e) + "\n"); }
+    job.model = model;
   } else {
     const bin = binFor(s.provider) || die(127, `${name}'s CLI isn't installed.`);
-    let cmdArgs;
     if (s.provider === "claude") {
       if (caller && caller === `${s.email}|${s.org}`) die(6, `${name} is the account you're running as. Pick another sub.`);
       if (inClaude && real(callerDir || path.join(HOME, ".claude")) === real(s.dir || path.join(HOME, ".claude"))) die(6, `${name} is the Claude account you're running as. Pick another sub.`);
       const w = claudeWho(bin, s.dir); if (!w || `${w.email}|${w.org}` !== `${s.email}|${s.org}`) die(10, `${name} isn't signed in as ${s.email} any more. Sign it in again: subhub signin ${name}`);
       Object.assign(env, envFor("claude", s.dir, env)); delete env.ANTHROPIC_API_KEY; delete env.ANTHROPIC_AUTH_TOKEN;
-      cmdArgs = ["-p", "--permission-mode", "bypassPermissions", "--settings", '{"disableAllHooks":true}', ...(model !== "default" ? ["--model", model] : []), brief];
-    } else if (s.provider === "codex") {
-      Object.assign(env, envFor("codex", s.dir, env)); if (!s.dir) delete env.CODEX_HOME;
-      cmdArgs = ["exec", "--sandbox", "danger-full-access", "--skip-git-repo-check", "-c", 'approval_policy="never"', ...(model !== "default" ? ["--model", model] : []), brief];
-    } else if (s.provider === "cursor") cmdArgs = ["--force", "--sandbox", "disabled", "--trust", "--approve-mcps", ...(model !== "default" ? ["--model", model] : []), "-p", brief];
-    else cmdArgs = ["--dangerously-skip-permissions", ...(model !== "default" ? ["--model", model] : []), "-p", brief];
-    let input;
-    if (isShim(bin)) {   // cmd.exe can't carry line breaks in an argument
-      const i = cmdArgs.lastIndexOf(brief);
-      if (s.provider === "claude") { cmdArgs.splice(i, 1); input = brief; }
-      else if (s.provider === "codex") { cmdArgs[i] = "-"; input = brief; }
-      else cmdArgs[i] = brief.replace(/\r?\n+/g, " ");
-    }
-    ({ out: answer, code } = await runSub(bin, cmdArgs, env, timeout, logf, input));
+      env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = "1";   // documented: no background commands or agents for a headless sub
+    } else if (s.provider === "codex") { Object.assign(env, envFor("codex", s.dir, env)); if (!s.dir) delete env.CODEX_HOME; }
+    const c = caps(s.provider, bin);
+    if (parent && !c.resume) die(11, `job ${parent.id} can't be continued: ${BINARY[s.provider]} on this computer has no resume option.`);
+    Object.assign(job, { bin, stream: c.stream && !env.SUBHUB_PLAIN, settings: !!c.settings });
   }
-  answer = (answer || "").trim();
-  if (code === 0 && !answer) code = 4;
-  if (code !== 0) {
-    if (code === 124) process.stderr.write(`SubHub: ${name} timed out after ${timeout / 1000} seconds.\n`);
-    let tail = ""; try { tail = fs.readFileSync(logf, "utf8").trim().split("\n").slice(-5).join("\n"); } catch {}
-    process.stderr.write(`SubHub: ${name} failed (exit ${code}). Last log lines:\n${tail}\n`);
+  prune();
+  do job.id = crypto.randomBytes(3).toString("hex"); while (pexist(jf(job.id, "")));
+  fs.mkdirSync(path.join(JOBS, job.id), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(jf(job.id, "brief.txt"), brief); writeJSON(jf(job.id), job);
+  if (job.bg) {   // a detached runner (this file again) does the work and outlives the caller
+    spawn(process.execPath, [SELF, "_run", job.id], { cwd, env, detached: true, stdio: "ignore", windowsHide: true }).unref();
+    console.log(`SubHub: started job ${job.id} (${name}, model ${job.model}) in ${cwd}.\nCollect it: subhub job wait ${job.id} 600 · progress: subhub job ${job.id} · stop: subhub job stop ${job.id}`);
+    process.exit(0);
   }
+  process.stderr.write(`SubHub: job ${job.id} (progress: subhub job ${job.id})\n`);
+  for (const k of Object.keys(process.env)) if (!(k in env)) delete process.env[k];
+  Object.assign(process.env, env);
+  const j = await execJob(job.id);
+  if (j.code !== 0) process.stderr.write(failNote(j));
+  const answer = jtext(j.id, "answer.txt"), changes = jtext(j.id, "changes.txt");
   if (answer) console.log(answer);
-  if (before && before !== gitSnap(process.cwd())) console.log(`\nSubHub: files in ${process.cwd()} that changed while ${name} ran (git status; includes anything else working here):\n${run("git", ["status", "--porcelain", "-uall"]).out.trimEnd()}`);
-  process.exit(code);
+  if (changes) console.log("\n" + changes);
+  process.exit(j.code);
 }
-/** Runs a sub's CLI with a time limit; on timeout the whole process tree is stopped. */
-function runSub(bin, args, env, timeout, logf, input) {
-  return new Promise((resolve) => {
-    const p = prep(bin, args);
-    const child = spawn(p.cmd, p.args, { ...p.opts, env, detached: !WIN, windowsHide: true, stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"] });
-    if (input !== undefined) child.stdin.end(input);
-    let out = "", timedOut = false; const log = fs.createWriteStream(logf, { flags: "a" });
-    child.stdout.on("data", (d) => (out += d)); child.stderr.pipe(log);
-    const t = setTimeout(() => {
-      timedOut = true;
-      if (WIN) spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true });
-      else { try { process.kill(-child.pid, "SIGTERM"); } catch {} setTimeout(() => { try { process.kill(-child.pid, "SIGKILL"); } catch {} }, 5000).unref(); }
-    }, timeout);
-    child.on("error", (e) => { clearTimeout(t); log.end(); resolve({ out: "", code: 127 }); fs.appendFileSync(logf, String(e) + "\n"); });
-    child.on("close", (c) => { clearTimeout(t); log.end(); resolve({ out, code: timedOut ? 124 : (c ?? 1) }); });
-  });
+
+// ---------------------------------------------------------------- jobs: ~/.subhub/jobs/<id>/ job.json brief.txt progress.log stdout.log stderr.log answer.txt
+const jf = (id, f = "job.json") => path.join(JOBS, id, f);
+const jget = (id) => /^[\w-]+$/.test(id || "") ? readJSON(jf(id)) : null;
+const jset = (id, o) => { const j = { ...jget(id), ...o }; writeJSON(jf(id), j); return j; };
+const jtext = (id, f) => { try { return fs.readFileSync(jf(id, f), "utf8"); } catch { return ""; } };
+const ls = (d) => { try { return fs.readdirSync(d); } catch { return []; } };
+const alive = (pid) => { if (!pid) return false; try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const ago = (ms) => { const s = Math.max(0, Math.round(ms / 1000)); return s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${Math.floor(s / 3600)}h ${Math.floor(s / 60) % 60}m`; };
+const clip = (v, n = 120) => { const s = String(v ?? "").replace(/\s+/g, " ").trim(); return s.length > n ? s.slice(0, n - 1) + "…" : s; };
+/** The most telling argument of a tool call, trimmed. */
+function argOf(o) {
+  if (!o || typeof o !== "object") return clip(o);
+  for (const k of ["command", "cmd", "CommandLine", "file_path", "path", "AbsolutePath", "TargetFile", "pattern", "query", "url", "Url", "description", "prompt"]) if (o[k]) return clip(o[k]);
+  const v = Object.values(o).find((x) => typeof x === "string"); return clip(v ?? JSON.stringify(o));
 }
-const withTimeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(Object.assign(new Error("timeout"), { timeout: true })), ms).unref())]);
+/** Stops a process and everything it started (its process group; taskkill /T on Windows). */
+function killTree(pid, sig = "SIGTERM") {
+  if (!pid) return;
+  if (WIN) { spawnSync("taskkill", ["/pid", String(pid), "/T", "/F"], { windowsHide: true }); return; }
+  const k = (g) => { try { process.kill(-pid, g); } catch { try { process.kill(pid, g); } catch {} } };
+  k(sig); if (sig !== "SIGKILL") setTimeout(() => k("SIGKILL"), 5000).unref();
+}
+/** A job as it really is: one marked running whose runner is gone (reboot, kill -9) becomes interrupted. */
+function jload(id) {
+  const j = jget(id); if (!j) return null;
+  if (j.state === "running") {
+    const dead = j.pid ? !alive(j.pid) : Date.now() - j.started > 60000, over = Date.now() - j.started > (j.timeout + 300) * 1000;
+    if (dead || over) {   // its sub CLI may outlive it: SubHub won't kill a pid it can't be sure of (after a reboot pids are reused)
+      return jset(id, { state: "interrupted", code: 1, ended: Date.now(), child: null, note: dead ? "Its runner process ended without recording a result (reboot, crash or kill)." : "It ran past its time limit." });
+    }
+  }
+  return j;
+}
+/** Why a job can't be continued, or "" if it can. */
+function whyNot(j) {
+  if (j.state === "running") return "it is still running (subhub job wait or subhub job stop it first)";
+  if (j.provider === "ollama") return pexist(jf(j.id, "history.json")) ? "" : "no conversation was saved";
+  return j.session ? "" : `no session id was captured from ${j.sub}${j.stream === false ? " (its CLI ran in plain mode, without a stream)" : ""}`;
+}
+function prune() {   // jobs older than SUBHUB_JOB_DAYS (7) go
+  const lim = Date.now() - (+process.env.SUBHUB_JOB_DAYS || 7) * 86400000;
+  for (const id of ls(JOBS)) {
+    const j = jget(id); let t = j ? j.ended || j.started : 0;
+    if (!t) try { t = fs.statSync(path.join(JOBS, id)).mtimeMs; } catch {}
+    if (t < lim && (!j || j.state !== "running" || !alive(j.pid))) fs.rmSync(path.join(JOBS, id), { recursive: true, force: true });
+  }
+}
+/** Appends timestamped progress lines; an exact repeat of the last line isn't written and doesn't count as activity. */
+function progressLog(id) {
+  let last = "", reps = 0;
+  const stamp = () => new Date().toTimeString().slice(0, 8);
+  return (text) => {
+    const t = clip(text, 240); if (!t) return false;
+    if (t === last) { reps++; return false; }
+    fs.appendFileSync(jf(id, "progress.log"), (reps ? `${stamp()} (the line before repeated ${reps} more times)\n` : "") + `${stamp()} ${t}\n`);
+    last = t; reps = 0; return true;
+  };
+}
+function failNote(j) {
+  const w = whyNot(j), how = w ? `It can't be continued: ${w}.` : `Continue it: subhub ask --continue ${j.id} "<what to do next>"`;
+  const head = j.state === "timeout" ? `${j.sub} timed out after ${j.timeout} seconds` : j.state === "stalled" ? `${j.sub} showed no activity for ${j.idle} seconds and was stopped as stalled`
+    : j.state === "stopped" ? `${j.sub} was stopped` : `${j.sub} failed (exit ${j.code})`;
+  const tail = jtext(j.id, "progress.log").trim().split("\n").slice(-5).join("\n");
+  return `SubHub: ${head} (job ${j.id}). ${how}\nLast progress lines:\n${tail}\n`;
+}
+function describe(j, n = 5) {
+  const now = Date.now(), prog = jtext(j.id, "progress.log").trimEnd().split("\n").filter(Boolean), w = whyNot(j);
+  const out = [`Job ${j.id}: ${j.state === "running" || j.state === "done" ? j.state : `${j.state} (exit ${j.code})`} · ${j.sub}, model ${j.model} · in ${j.folder}`,
+    `Started ${new Date(j.started).toLocaleString()} · ${j.state === "running" ? "running for" : "ran for"} ${ago((j.ended || now) - j.started)} · last activity ${ago(now - (j.active || j.started))} ago`];
+  if (j.parent) out.push(`Follow-up to job ${j.parent}.`);
+  if (j.note) out.push(j.note);
+  if (j.state === "running") out.push(`Wait: subhub job wait ${j.id} 600 · stop: subhub job stop ${j.id} · ${j.session || j.provider === "ollama" ? "can be continued once it ends" : "no session id yet"}`);
+  else out.push(`Answer: subhub job result ${j.id} · ${w ? `can't be continued: ${w}` : `continue: subhub ask --continue ${j.id} "<follow-up>"`}`);
+  out.push(prog.length ? "Last progress:" : "No progress yet.", ...prog.slice(-n).map((l) => "  " + l));
+  return out.join("\n");
+}
+
+// ---------------------------------------------------------------- each CLI's headless stream, from its docs; gated on its --help
+// claude -p --output-format stream-json --verbose, --resume <session_id>  (code.claude.com/docs/en/headless)
+// codex exec --json, codex exec resume <thread_id>                         (developers.openai.com/codex/noninteractive)
+// cursor-agent -p --output-format stream-json, --resume <session_id>       (cursor.com/docs/cli/reference/output-format)
+// agy -p --output-format stream-json, --conversation <conversation_id>     (antigravity.google/docs/cli/headless)
+const AGY_SETTINGS = '{"toolPermission":"always-proceed","allowNonWorkspaceAccess":true}';
+function caps(p, bin) {
+  let st = {}; try { st = fs.statSync(bin); } catch {}
+  const key = `${bin}|${st.size}|${st.mtimeMs}`, f = path.join(CACHE, `help-${p}.json`), c = readJSON(f);
+  if (c?.key === key) return c;
+  const h = run(bin, p === "codex" ? ["exec", "--help"] : ["--help"], { timeout: 30000 }), t = h.out + h.err;
+  const has = (re) => re.test(t);
+  const o = { key, stream: has({ claude: /stream-json/, codex: /--json\b/, cursor: /stream-json/, gemini: /stream-json/ }[p]),
+    resume: has({ claude: /--resume\b/, codex: /\bresume\b/, cursor: /--resume\b/, gemini: /--conversation\b/ }[p]), settings: p === "gemini" && has(/--settings\b/) };
+  if (t.trim()) writeJSON(f, o);
+  return o;
+}
+function cliArgs(j, brief) {
+  const m = j.model !== "default" ? ["--model", j.model] : [], sid = j.resume, sj = j.stream;
+  let a, input;
+  if (j.provider === "claude") a = ["-p", ...(sj ? ["--output-format", "stream-json", "--verbose"] : []), ...(sid ? ["--resume", sid] : []), "--permission-mode", "bypassPermissions", "--settings", '{"disableAllHooks":true}', ...m, brief];
+  else if (j.provider === "codex") a = sid ? ["exec", "resume", ...(sj ? ["--json"] : []), "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", ...m, sid, brief]
+    : ["exec", ...(sj ? ["--json"] : []), "--sandbox", "danger-full-access", "--skip-git-repo-check", "-c", 'approval_policy="never"', ...m, brief];
+  else if (j.provider === "cursor") a = ["--force", "--sandbox", "disabled", "--trust", "--approve-mcps", ...(sj ? ["--output-format", "stream-json"] : []), ...(sid ? ["--resume", sid] : []), ...m, "-p", brief];
+  else a = ["--dangerously-skip-permissions", ...(j.settings ? ["--settings", AGY_SETTINGS] : []), ...(sj ? ["--output-format", "stream-json"] : []), ...(sid ? ["--conversation", sid] : []), ...m, "-p", brief];
+  if (isShim(j.bin)) {   // cmd.exe can't carry line breaks in an argument
+    const i = a.lastIndexOf(brief);
+    if (j.provider === "claude") { a.splice(i, 1); input = brief; }
+    else if (j.provider === "codex") { a[i] = "-"; input = brief; }
+    else a[i] = brief.replace(/\r?\n+/g, " ");
+  }
+  return { args: a, input };
+}
+/** Turns one stream event into progress lines, the session id and the answer (r collects them). */
+const PARSE = {
+  claude(e, r) {
+    if (e.session_id) r.session ||= e.session_id;
+    const sub = e.parent_tool_use_id ? "(subagent) " : "";
+    if (e.type === "system" && e.subtype === "init") r.log(`started${e.model ? " on " + e.model : ""}`);
+    else if (e.type === "system" && e.subtype === "api_retry") r.log(`API retry ${e.attempt}/${e.max_retries}: ${e.error}`);
+    else if (e.type === "assistant") for (const b of e.message?.content || []) {
+      if (b.type === "text" && b.text?.trim()) { if (!sub) r.text = b.text; r.log(`${sub}says: ${clip(b.text)}`); }
+      else if (b.type === "tool_use") r.log(`${sub}${b.name} ${argOf(b.input)}`);
+    }
+    else if (e.type === "user") { for (const b of Array.isArray(e.message?.content) ? e.message.content : []) if (b.type === "tool_result" && b.is_error) r.log(`${sub}tool error: ${clip(typeof b.content === "string" ? b.content : JSON.stringify(b.content))}`); }
+    else if (e.type === "result") { r.answer = e.result ?? r.text; r.error = !!e.is_error; r.log(`finished: ${e.subtype || (e.is_error ? "error" : "success")}`); }
+  },
+  codex(e, r) {
+    if (e.type === "thread.started") { r.session ||= e.thread_id; r.log("started"); }
+    else if (e.type === "item.started" || e.type === "item.completed") {
+      const it = e.item || {}, done = e.type === "item.completed";
+      if (it.type === "agent_message" && done) { r.text = it.text || ""; r.log(`says: ${clip(it.text)}`); }
+      else if (it.type === "command_execution") r.log(done ? `ran (exit ${it.exit_code ?? "?"}): ${clip(it.command)}` : `run: ${clip(it.command)}`);
+      else if (it.type === "file_change" && done) r.log(`edit: ${clip((it.changes || []).map((c) => `${c.kind || ""} ${c.path}`).join(", "))}`);
+      else if (it.type === "mcp_tool_call" && !done) r.log(`tool ${it.server}.${it.tool}`);
+      else if (it.type === "web_search" && !done) r.log(`search: ${clip(it.query)}`);
+      else if (it.type === "reasoning" && done) r.log(`thinking: ${clip(it.text, 80)}`);
+      else if (it.type === "error") r.log(`error: ${clip(it.message)}`);
+    }
+    else if (e.type === "turn.failed") { r.error = true; r.log(`error: ${clip(e.error?.message)}`); }
+    else if (e.type === "error") r.log(`error: ${clip(e.message)}`);
+    else if (e.type === "turn.completed") { r.answer = r.text; r.log("finished"); }
+  },
+  cursor(e, r) {
+    if (e.session_id) r.session ||= e.session_id;
+    if (e.type === "system" && e.subtype === "init") r.log(`started${e.model ? " on " + e.model : ""}`);
+    else if (e.type === "assistant") { const t = (e.message?.content || []).map((b) => b.text || "").join(""); if (t.trim()) { r.text = t; r.log(`says: ${clip(t)}`); } }
+    else if (e.type === "tool_call") {
+      const k = Object.keys(e.tool_call || {})[0], v = (k && e.tool_call[k]) || {};
+      let a = v.args ?? v.arguments; if (typeof a === "string") { try { a = JSON.parse(a); } catch {} }
+      if (e.subtype === "started") r.log(`${k === "function" ? v.name : String(k || "tool").replace(/ToolCall$/, "")} ${argOf(a)}`);
+      else if (v.result?.error || v.result?.failure) r.log(`tool error: ${clip(JSON.stringify(v.result.error || v.result.failure))}`);
+    }
+    else if (e.type === "result") { r.answer = e.result ?? r.text; r.error = !!e.is_error; r.log(`finished: ${e.subtype || "?"}`); }
+  },
+  gemini(e, r) {
+    const u = e.step_update || e.init || e.result || {};
+    if (e.conversation_id || u.conversation_id) r.session ||= e.conversation_id || u.conversation_id;
+    if (e.event === "init") r.log(`started (${u.permission_mode || "?"})`);
+    else if (e.event === "step_update") {
+      const k = String(u.step_index);
+      if (u.tool_info && !r.seen.has(k)) { r.seen.add(k); r.log(`${u.tool_info.name} ${argOf(u.tool_info.parameters)}`); }
+      else if (u.subagent_info && !r.seen.has(k)) { r.seen.add(k); r.log(`subagent: ${argOf(u.subagent_info)}`); }
+      else if (u.step_type === "agent_response") {
+        const b = r.buf[k] || "", d = u.text_delta || "";
+        if (u.state === "ACTIVE") r.buf[k] = b + d;
+        else { const t = b && d.startsWith(b) ? d : b + d; if (t.trim()) { r.text = t; r.log(`says: ${clip(t)}`); } }
+      }
+    }
+    else if (e.event === "result") { r.answer = u.response ?? r.text; r.error = !!u.status && u.status !== "SUCCESS"; r.log(`finished: ${u.status || "?"}`); }
+  },
+};
+
+/** Runs one job to the end (in the foreground ask, or in the detached runner) and records the outcome. */
+async function execJob(id) {
+  const j = jget(id), brief = jtext(id, "brief.txt"), say = progressLog(id), t0 = Date.now();
+  let active = t0, saved = t0, why = "", child = null, reject = null, answer = "", code = 0;
+  const r = { session: null, text: "", answer: null, error: false, seen: new Set(), buf: {}, log: (t) => { if (say(t)) active = Date.now(); } };
+  jset(id, { pid: process.pid, active });
+  const before = gitSnap(j.folder);
+  const stop = (w) => { if (why) return; why = w; if (child) killTree(child.pid); reject?.(Object.assign(new Error(w), { why: w })); };
+  const onSig = () => stop("stopped"); const SIGS = WIN ? ["SIGINT"] : ["SIGTERM", "SIGINT", "SIGHUP"];
+  for (const g of SIGS) process.on(g, onSig);
+  const tick = setInterval(() => {
+    const now = Date.now();
+    if (pexist(jf(id, "stop"))) stop("stopped");
+    else if (j.idle && now - active > j.idle * 1000) stop("stalled");
+    else if (now - t0 > j.timeout * 1000) stop("timeout");
+    if (active !== saved) { saved = active; jset(id, { active }); }
+  }, 1000);
+  const guard = new Promise((_, rej) => (reject = rej)); guard.catch(() => {});
+  try {
+    if (j.provider === "ollama") {
+      const hist = j.parent ? readJSON(jf(j.parent, "history.json")) : null;
+      r.log(`started on ${j.model}${hist ? " with the earlier conversation" : ""}`);
+      const res = await Promise.race([ollamaAgent(j.model, brief, false, hist, { log: r.log, save: (h) => writeJSON(jf(id, "history.json"), h), stopped: () => !!why }), guard]);
+      answer = res.answer; r.log("finished");
+    } else {
+      const { args, input } = cliArgs(j, brief), parse = j.stream ? PARSE[j.provider] : null;
+      const raw = fs.createWriteStream(jf(id, "stdout.log")), errf = fs.createWriteStream(jf(id, "stderr.log")), rest = { o: "", e: "" };
+      let plain = "", events = 0, lastOut = null;
+      const line = (l, isErr) => {
+        if (isErr) return r.log(l);
+        if (l !== lastOut) { active = Date.now(); lastOut = l; }
+        let e = null; if (parse && l.trimStart().startsWith("{")) { try { e = JSON.parse(l); } catch {} }
+        if (!e) { plain += l + "\n"; return; }
+        events++; const had = r.session; try { parse(e, r); } catch {}
+        if (r.session && !had) jset(id, { session: r.session });   // as early as possible: even a timed-out job can be continued
+      };
+      const feed = (k, isErr) => (d) => { (isErr ? errf : raw).write(d); const ls = (rest[k] + d).split(/\r?\n/); rest[k] = ls.pop(); for (const l of ls) line(l, isErr); };
+      code = await new Promise((resolve) => {
+        const p = prep(j.bin, args);
+        child = spawn(p.cmd, p.args, { ...p.opts, cwd: j.folder, env: process.env, detached: !WIN, windowsHide: true, stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"] });
+        child.on("error", (e) => { errf.write(String(e) + "\n"); r.log(`couldn't start ${j.bin}: ${e.message}`); resolve(127); });
+        child.on("close", (c) => resolve(c ?? 1));
+        if (child.pid) jset(id, { child: child.pid });
+        if (input !== undefined) { child.stdin.on("error", () => {}); child.stdin.end(input); }
+        child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
+        child.stdout.on("data", feed("o")); child.stderr.on("data", feed("e", true));
+        if (why) killTree(child.pid);
+      });
+      if (rest.o) line(rest.o, false); if (rest.e) line(rest.e, true);
+      raw.end(); errf.end();
+      if (parse && !events && plain.trim()) r.log("no stream events: read the output as plain text");
+      answer = parse && events ? (r.answer ?? r.text) || (r.text || plain) : plain;
+      if (r.error && code === 0) code = 1;
+    }
+  } catch (e) { if (!e.why) { code = 1; r.log(`error: ${e.message}`); fs.appendFileSync(jf(id, "stderr.log"), String(e.stack || e) + "\n"); } }
+  clearInterval(tick); for (const g of SIGS) process.off(g, onSig);
+  if (!why && pexist(jf(id, "stop"))) why = "stopped";   // subhub job stop may kill the CLI before the next tick sees its note
+  answer = String(answer || "").trim();
+  code = { timeout: 124, stalled: 12, stopped: 13 }[why] ?? (code === 0 && !answer ? 4 : code);
+  if (why) say(why === "timeout" ? `timed out after ${j.timeout}s` : why === "stalled" ? `no activity for ${j.idle}s: stopped as stalled` : "stopped");
+  let changes = "";
+  if (before && before !== gitSnap(j.folder)) changes = `SubHub: files in ${j.folder} that changed while ${j.sub} ran (git status; includes anything else working here):\n${run("git", ["status", "--porcelain", "-uall"], { cwd: j.folder }).out.trimEnd()}`;
+  fs.writeFileSync(jf(id, "answer.txt"), answer); if (changes) fs.writeFileSync(jf(id, "changes.txt"), changes);
+  return jset(id, { state: why === "timeout" ? "timeout" : why || (code === 0 ? "done" : "failed"), code, ended: Date.now(), active, session: r.session || j.session || null, child: null });
+}
+
+async function cmdJobs(args) {
+  prune();
+  const all = ls(JOBS).map(jload).filter(Boolean).sort((a, b) => b.started - a.started).filter((j, i) => j.state === "running" || i < 20), now = Date.now();
+  if (args.includes("--json")) { console.log(JSON.stringify(all.map((j) => ({ ...j, sinceActivity: now - (j.active || j.started), continuable: !whyNot(j) })))); return; }
+  if (!all.length) { console.log("No jobs yet."); return; }
+  for (const j of all) console.log(`${j.id}  ${j.state.padEnd(11)} ${j.sub.padEnd(10)} ${(ago(now - j.started) + " ago").padEnd(10)} ${j.state === "running" ? `active ${ago(now - (j.active || j.started))} ago  ` : ""}${j.title || ""}`);
+}
+async function cmdJob(args) {
+  const verb = ["tail", "result", "wait", "stop"].includes(args[0]) ? args[0] : "show", id = verb === "show" ? args[0] : args[1];
+  if (!id) die(2, "name a job, for example: subhub job a1b2c3 (subhub jobs lists them)");
+  let j = jload(id) || die(2, `no job '${id}'. subhub jobs lists them.`);
+  const result = () => {
+    if (j.code !== 0) process.stderr.write(failNote(j));
+    const a = jtext(id, "answer.txt"), c = jtext(id, "changes.txt");
+    if (a) console.log(a); if (c) console.log("\n" + c);
+    process.exit(j.code ?? 1);
+  };
+  if (verb === "show") console.log(args.includes("--json") ? JSON.stringify({ ...j, sinceActivity: Date.now() - (j.active || j.started), continuable: !whyNot(j) }) : describe(j));
+  else if (verb === "tail") console.log(jtext(id, "progress.log").trimEnd().split("\n").slice(-(+args[2] || 20)).join("\n"));
+  else if (verb === "result") { if (j.state === "running") { console.log(describe(j)); process.exit(14); } result(); }
+  else if (verb === "wait") {
+    const until = Date.now() + (args[2] === undefined ? 600 : Math.max(0, +args[2] || 0)) * 1000;
+    while (j.state === "running" && Date.now() < until) { await sleep(Math.min(1000, Math.max(50, until - Date.now()))); j = jload(id); }
+    if (j.state === "running") { console.log(describe(j)); process.exit(14); }
+    result();
+  } else {
+    if (j.state !== "running") { console.log(`Job ${id} isn't running (${j.state}).`); return; }
+    fs.writeFileSync(jf(id, "stop"), String(Date.now()));
+    if (j.child) killTree(j.child);
+    for (let i = 0; i < 40 && j.state === "running"; i++) { await sleep(250); j = jget(id); }
+    if (j.state === "running") { killTree(j.child, "SIGKILL"); killTree(j.pid, "SIGKILL"); j = jset(id, { state: "stopped", code: 13, ended: Date.now(), child: null }); }
+    const w = whyNot(j);
+    console.log(`Stopped job ${id}. ${w ? `It can't be continued: ${w}.` : `Continue it: subhub ask --continue ${id} "<what to do next>"`}`);
+  }
+}
 
 // ---------------------------------------------------------------- Ollama: its HTTP API, every feature the model reports
 const ollamaHost = () => { const h = process.env.OLLAMA_HOST || "127.0.0.1:11434"; return h.startsWith("http") ? h : "http://" + h; };
@@ -491,7 +767,7 @@ async function transcribe(file, model) {
   catch (e) { return `(couldn't transcribe: ${e.message})`; }
 }
 /** One task for an Ollama model, using what it supports: tools, vision, audio, thinking, its full context. */
-async function ollamaAgent(model, task, driver, history = null) {
+async function ollamaAgent(model, task, driver, history = null, hooks = {}) {   // hooks: log(progress line), save(history), stopped()
   const s = await ollamaShow(model); const caps = s.caps, tools = {};
   if (caps.includes("tools")) {
     Object.assign(tools, TOOLS);
@@ -509,17 +785,24 @@ async function ollamaAgent(model, task, driver, history = null) {
   const req = { model, messages: history, stream: false, options: s.ctx ? { num_ctx: Math.min(s.ctx, +process.env.SUBHUB_OLLAMA_CTX || 65536) } : {} };
   if (Object.keys(tools).length) req.tools = Object.values(tools).map((t) => t[1]);
   if (caps.includes("thinking")) { const t = process.env.SUBHUB_OLLAMA_THINK; req.think = t ? ({ true: true, false: false }[t] ?? t) : true; }
+  hooks.save?.(history);
   for (let i = 0; i < (+process.env.SUBHUB_OLLAMA_STEPS || 40); i++) {
+    if (hooks.stopped?.()) throw Object.assign(new Error("stopped"), { why: "stopped" });
+    hooks.log?.(`asking ${model} (step ${i + 1})`);
     const out = (await oapi("/api/chat", req)).message || {};
     history.push({ role: "assistant", content: out.content || "", ...(out.tool_calls ? { tool_calls: out.tool_calls } : {}) });
-    if (!out.tool_calls?.length) return { answer: (out.content || "").trim(), history };
+    hooks.save?.(history);
+    if (!out.tool_calls?.length) { hooks.log?.(`says: ${clip(out.content)}`); return { answer: (out.content || "").trim(), history }; }
     for (const c of out.tool_calls) {
       const name = c.function?.name; let a = c.function?.arguments || {};
       if (typeof a === "string") { try { a = JSON.parse(a); } catch { a = {}; } }
+      hooks.log?.(`${name} ${argOf(a)}`);
       let result; try { result = tools[name] ? await tools[name][0](a) : `no tool named ${name}`; } catch (e) { result = `error: ${e.message}`; }
+      if (/^(error|no tool)/.test(String(result))) hooks.log?.(`${name}: ${clip(result)}`);
       if (process.env.SUBHUB_OLLAMA_VERBOSE) process.stderr.write(`· ${name} ${JSON.stringify(a).slice(0, 120)}\n`);
       history.push({ role: "tool", tool_name: name, content: String(result).slice(0, 30000) });
     }
+    hooks.save?.(history);
   }
   return { answer: "Stopped before a final answer (step limit).", history };
 }
@@ -739,6 +1022,9 @@ switch (cmd) {
   case "list": await cmdList(rest.includes("--refresh")); break;
   case "models": await cmdModels(rest[0]); break;
   case "ask": await cmdAsk(rest); break;
+  case "jobs": await cmdJobs(rest); break;
+  case "job": await cmdJob(rest); break;
+  case "_run": { let j; try { j = await execJob(rest[0]); } catch (e) { j = jset(rest[0], { state: "failed", code: 1, ended: Date.now(), note: String(e.message || e) }); } process.exit(j.code ?? 1); }
   case "status": await cmdStatus(rest); break;
   case "refresh": await refresh(); console.log("Refreshed."); break;
   case "install": await cmdInstall(withRules); break;
@@ -750,5 +1036,5 @@ switch (cmd) {
   case "config": console.log(`${CFG}:\n` + (pexist(CFG) ? fs.readFileSync(CFG, "utf8") : '(none yet: {"subs":{"<sub>":{"on":true,"use_for":"","model":"default","notes":""}},"order":[]})')); break;
   case "ollama": await cmdOllama(rest); break;
   case "version": case "--version": console.log(`subhub ${VERSION}`); break;
-  default: console.log(fs.readFileSync(SELF, "utf8").split("\n").slice(1, 18).map((l) => l.replace(/^\/\/ ?/, "")).join("\n"));
+  default: { const ls = fs.readFileSync(SELF, "utf8").split("\n"); console.log(ls.slice(1, ls.findIndex((l) => l.startsWith("import "))).map((l) => l.replace(/^\/\/ ?/, "")).join("\n")); }
 }
