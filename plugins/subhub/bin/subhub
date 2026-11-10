@@ -17,7 +17,7 @@
 # Exit codes of ask: 0 answer on stdout · 2 bad sub, model or folder · 3 loop guard · 4 empty answer
 # 6 that sub is you · 7 not signed in / app not running · 8 turned off · 10 signed in as another account
 # 124 timeout · 127 CLI missing
-VERSION=1.0.1
+VERSION=1.0.2
 SH="$HOME/.subhub"; REG="$SH/registry.tsv"; CFG="$SH/config.json"; IGN="$SH/ignored"; CACHE="$SH/cache"
 TAB=$(printf '\t')
 export USER="${USER:-$(id -un)}" LOGNAME="${LOGNAME:-$(id -un)}"   # Claude reads its Keychain sign-in by user name
@@ -327,13 +327,13 @@ connect() {
   b=$(agent_bin "$1"); [ -n "$b" ] || { echo "  $(agent_name "$1"): not installed, skipped"; return 0; }
   case $1 in
     claude)
-      "$b" plugin marketplace add "$SRC_REPO" >/dev/null 2>&1; "$b" plugin marketplace update subhub >/dev/null 2>&1
+      { "$b" plugin marketplace remove subhub; "$b" plugin marketplace add "${SUBHUB_MARKET:-$SRC_REPO}"; } >/dev/null 2>&1
       { "$b" plugin install subhub@subhub && "$b" plugin update subhub@subhub; } >/dev/null 2>&1 \
         || { mkdir -p "$HOME/.claude/skills"; rm -rf "$HOME/.claude/skills/subhub"; cp -R "$SRC" "$HOME/.claude/skills/subhub"; }
       for r in $RULES; do allow add "$HOME/.claude/settings.json" "Bash($r *)"; done
       allow add "$HOME/.claude/settings.json" "Skill(subhub:subhub)" ;;
     codex) h=${CODEX_HOME:-$HOME/.codex}
-      "$b" plugin marketplace add "$SRC_REPO" >/dev/null 2>&1; "$b" plugin marketplace upgrade subhub >/dev/null 2>&1
+      { "$b" plugin remove subhub; "$b" plugin marketplace remove subhub; "$b" plugin marketplace add "${SUBHUB_MARKET:-$SRC_REPO}"; } >/dev/null 2>&1
       "$b" plugin add subhub@subhub >/dev/null 2>&1 \
         || { mkdir -p "$h/skills"; rm -rf "$h/skills/subhub"; cp -R "$SRC/skills/subhub" "$h/skills/subhub"; }
       mkdir -p "$h/rules"; { echo "# Written by SubHub: lets Codex run subhub without asking."

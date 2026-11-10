@@ -9,4 +9,6 @@ else
   src="$HOME/.subhub/src"
   if [ -d "$src/.git" ]; then git -C "$src" pull --ff-only -q; else git clone -q --depth 1 "$REPO" "$src"; fi
 fi
+# Downloaded: agents install the plugin from GitHub, so they get updates from there.
+[ "$src" = "$HOME/.subhub/src" ] && export SUBHUB_MARKET=${SUBHUB_MARKET:-https://github.com/PrimeNexes/SubHub}
 SUBHUB_REPO=$src exec sh "$src/plugins/subhub/bin/subhub" install
