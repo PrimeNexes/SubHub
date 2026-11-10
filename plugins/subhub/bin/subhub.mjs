@@ -58,10 +58,16 @@ function which(name) {
 const BINARY = { claude: "claude", codex: "codex", cursor: "cursor-agent", gemini: "agy", ollama: "ollama" };
 const binFor = (p) => which(BINARY[p]);
 
-/** Arguments for a Windows .cmd/.bat shim go through cmd.exe: quote and escape them. */
-function cmdQuote(a) { return '"' + String(a).replace(/(["^&|<>%!])/g, "^$1").replace(/\r?\n/g, " ") + '"'; }
+/** A Windows .cmd/.bat shim (npm installs these) runs through cmd.exe, which needs its own escaping
+ * (the same rules as the cross-spawn package). cmd.exe can't pass line breaks: see shimSafe(). */
+const isShim = (cmd) => WIN && /\.(cmd|bat)$/i.test(cmd);
+const META = /([()\][%!^"`<>&|;, *?])/g;
+function escArg(a) {
+  a = String(a).replace(/(?=(\\+?)?)\1"/g, '$1$1\\"').replace(/(?=(\\+?)?)\1$/, "$1$1");
+  return `"${a}"`.replace(META, "^$1").replace(META, "^$1");   // twice: the shim parses its arguments again
+}
 function prep(cmd, args) {
-  if (WIN && /\.(cmd|bat)$/i.test(cmd)) return { cmd: process.env.ComSpec || "cmd.exe", args: ["/d", "/s", "/c", [cmdQuote(cmd), ...args.map(cmdQuote)].join(" ")], opts: { windowsVerbatimArguments: true } };
+  if (isShim(cmd)) return { cmd: process.env.ComSpec || "cmd.exe", args: ["/d", "/s", "/c", `"${[cmd.replace(META, "^$1"), ...args.map(escArg)].join(" ")}"`], opts: { windowsVerbatimArguments: true } };
   return { cmd, args, opts: {} };
 }
 /** Runs a command and waits (for short checks). */
@@ -381,7 +387,14 @@ async function cmdAsk(argv) {
       cmdArgs = ["exec", "--sandbox", "danger-full-access", "--skip-git-repo-check", "-c", 'approval_policy="never"', ...(model !== "default" ? ["--model", model] : []), brief];
     } else if (s.provider === "cursor") cmdArgs = ["--force", "--sandbox", "disabled", "--trust", "--approve-mcps", ...(model !== "default" ? ["--model", model] : []), "-p", brief];
     else cmdArgs = ["--dangerously-skip-permissions", ...(model !== "default" ? ["--model", model] : []), "-p", brief];
-    ({ out: answer, code } = await runSub(bin, cmdArgs, env, timeout, logf));
+    let input;
+    if (isShim(bin)) {   // cmd.exe can't carry line breaks in an argument
+      const i = cmdArgs.lastIndexOf(brief);
+      if (s.provider === "claude") { cmdArgs.splice(i, 1); input = brief; }
+      else if (s.provider === "codex") { cmdArgs[i] = "-"; input = brief; }
+      else cmdArgs[i] = brief.replace(/\r?\n+/g, " ");
+    }
+    ({ out: answer, code } = await runSub(bin, cmdArgs, env, timeout, logf, input));
   }
   answer = (answer || "").trim();
   if (code === 0 && !answer) code = 4;
@@ -395,10 +408,11 @@ async function cmdAsk(argv) {
   process.exit(code);
 }
 /** Runs a sub's CLI with a time limit; on timeout the whole process tree is stopped. */
-function runSub(bin, args, env, timeout, logf) {
+function runSub(bin, args, env, timeout, logf, input) {
   return new Promise((resolve) => {
     const p = prep(bin, args);
-    const child = spawn(p.cmd, p.args, { ...p.opts, env, detached: !WIN, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(p.cmd, p.args, { ...p.opts, env, detached: !WIN, windowsHide: true, stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"] });
+    if (input !== undefined) child.stdin.end(input);
     let out = "", timedOut = false; const log = fs.createWriteStream(logf, { flags: "a" });
     child.stdout.on("data", (d) => (out += d)); child.stderr.pipe(log);
     const t = setTimeout(() => {
