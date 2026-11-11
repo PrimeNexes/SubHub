@@ -22,7 +22,9 @@ Heredocs work in bash and zsh (Claude Code uses bash on Windows too). Where ther
 To run in another folder (a git worktree you made for it): `subhub ask --in <folder> <sub> <model> <<'SUBHUB_BRIEF_END'`. All models of one sub: `subhub models <sub>`.
 
 ## Choosing
-- Match the task to "Use it for" and check "Can do, and limits". When several fit, prefer the one listed first. If one fails or reports a usage limit, move down the list, then do it yourself.
+- Match the task to "Use it for" and check "Can do, and limits". When several fit, prefer the one listed first.
+- If a sub fails, stalls or reports a usage limit, try one other sub once, then do the work yourself (or with a built-in sub-agent). Never retry the same sub, and never loop through subs. (A timeout or stall of a job that got somewhere can instead be continued once with `--continue`.)
+- In Claude Code with the SubHub plugin, the simplest way to delegate is the Agent tool with subagent_type `subhub:relay`: it runs these steps on a cheap model and returns the sub's answer and job id. Optional first line of its prompt: `use: <sub> [model]`, or `continue: <job id>` for a follow-up.
 - Pick the model per task: the strongest for hard, long or high-stakes work, a fast one for simple or bulk work, a big-context one for huge inputs. A different model family gives a more independent second opinion. When the user picked a sub's model, pass default unless the task needs another. Quote ids with brackets, like 'opus[1m]'.
 - Independent pieces can run at the same time: start each with `subhub ask --bg …`, one per sub, then collect them.
 

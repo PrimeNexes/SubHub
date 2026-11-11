@@ -13,7 +13,7 @@ Edit only this file, with your file-edit tool so the user sees the change. Keep 
 
 ```json
 { "subs": { "gemini-1": { "on": true, "use_for": "Web research only", "model": "default", "notes": "Answer in bullet points." } },
-  "order": ["codex-1", "claude-2"] }
+  "order": ["codex-1", "claude-2"], "hook": true }
 ```
 
 | Field | Meaning |
@@ -23,6 +23,8 @@ Edit only this file, with your file-edit tool so the user sees the change. Keep 
 | `model` | used when an agent passes default; an id from `subhub models <sub>` (Claude: fable, opus, sonnet, haiku) |
 | `notes` | added to every brief for this sub, under 2,000 characters |
 | `order` | sub names, most preferred first |
+| `hook` | Claude Code only. false: turns off the redirect hook that sends generic built-in sub-agents (general-purpose, Explore) to the `subhub:relay` agent. Default on. `SUBHUB_HOOK=0` in the environment also turns it off |
+| `hook_types` | Claude Code only. The sub-agent types the hook redirects, replacing the default `["general-purpose", "Explore", "claude", ""]` (`""` = a call with no type) |
 
 Changes apply on the next `subhub ask` call.
 

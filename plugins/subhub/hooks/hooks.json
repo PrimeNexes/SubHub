@@ -1,0 +1,13 @@
+{
+  "description": "SubHub: sends a generic built-in sub-agent call (general-purpose, Explore) to the subhub:relay agent once, when one of the user's other AI subscriptions is ready. Off: \"hook\": false in ~/.subhub/config.json, or SUBHUB_HOOK=0.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Agent|Task",
+        "hooks": [
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/subhub.mjs\" hook pretool", "timeout": 10 }
+        ]
+      }
+    ]
+  }
+}

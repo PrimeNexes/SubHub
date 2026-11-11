@@ -120,7 +120,7 @@ await new Promise((r) => server.listen(0, "127.0.0.1", r));
 
 // ---------- running the engine (async, so the stand-in server keeps answering)
 const baseEnv = { ...process.env, HOME: H, USERPROFILE: H, PATH: BINDIR + path.delimiter + process.env.PATH, OLLAMA_HOST: `127.0.0.1:${server.address().port}`, SUBHUB_MARKET: ROOT };
-for (const v of ["CLAUDECODE", "CLAUDE_CODE_USER_EMAIL", "CLAUDE_CODE_ORGANIZATION_UUID", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "SUBHUB_DEPTH", "OLLAMA_API_KEY"]) delete baseEnv[v];
+for (const v of ["CLAUDECODE", "CLAUDE_CODE_USER_EMAIL", "CLAUDE_CODE_ORGANIZATION_UUID", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "SUBHUB_DEPTH", "SUBHUB_HOOK", "OLLAMA_API_KEY"]) delete baseEnv[v];
 const sh = (args, { env = {}, input, cwd = WORK } = {}) => new Promise((resolve) => {
   const c = spawn(process.execPath, [ENGINE, ...args], { env: { ...baseEnv, ...env }, cwd, windowsHide: true });
   let out = "", err = ""; c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", (d) => (err += d));
@@ -263,6 +263,76 @@ r = await sh(["ask", "--continue", "nope99", "x"]); ok(r.code === 2, "continue o
 mk(path.join(JOBS, "old001", "job.json"), JSON.stringify({ id: "old001", sub: "gemini-1", state: "done", started: Date.now() - 9 * 86400000, ended: Date.now() - 8 * 86400000 }));
 await sh(["jobs"]); ok(!fs.existsSync(path.join(JOBS, "old001")) && fs.existsSync(path.join(JOBS, "dead01")), "jobs older than 7 days are pruned");
 
+// 5c. Claude Code: the relay agent and the redirect hook (subhub hook pretool, PreToolUse on Agent|Task)
+const rd = (f) => { try { return fs.readFileSync(f, "utf8"); } catch { return null; } };
+const PLUG = path.join(ROOT, "plugins", "subhub"), CFGF = path.join(H, ".subhub", "config.json");
+const hook = (input, { env = {}, home = H } = {}) => sh(["hook", "pretool"], { env: { HOME: home, USERPROFILE: home, ...env }, input: typeof input === "string" ? input : JSON.stringify(input) });
+const call = (type, prompt = "find the API endpoints", session = "sess-1", tool = "Agent") => ({ session_id: session, hook_event_name: "PreToolUse", tool_name: tool, cwd: WORK, tool_input: { description: "d", prompt, ...(type === undefined ? {} : { subagent_type: type }) } });
+const denied = (r) => { try { const o = JSON.parse(r.out).hookSpecificOutput; return r.code === 0 && o.hookEventName === "PreToolUse" && o.permissionDecision === "deny" && /subhub:relay/.test(o.permissionDecisionReason) && /repeat this exact call/.test(o.permissionDecisionReason); } catch { return false; } };
+const quiet = (r) => r.code === 0 && r.out === "" && r.err === "";
+r = await hook(call("general-purpose")); ok(denied(r), "hook: general-purpose is denied once, pointing at subhub:relay", JSON.stringify(r));
+r = await hook(call("general-purpose")); ok(quiet(r), "hook: the same call again (same session and prompt) is allowed", JSON.stringify(r));
+r = await hook(call("general-purpose", "find the API endpoints", "sess-2")); ok(denied(r), "hook: the same prompt in another session is denied once");
+r = await hook(call("Explore", "p-explore")); ok(denied(r), "hook: Explore is denied once");
+r = await hook(call(undefined, "p-notype")); ok(denied(r), "hook: a call with no subagent_type is denied once");
+r = await hook(call("general-purpose", "p-task", "sess-1", "Task")); ok(denied(r), "hook: the older Task tool name is matched too");
+for (const t of ["subhub:relay", "code-reviewer", "fork", "Plan", "my-plugin:worker"]) { r = await hook(call(t, "p-" + t)); ok(quiet(r), `hook: ${t} is allowed`, JSON.stringify(r)); }
+r = await hook({ ...call("general-purpose", "p-bash"), tool_name: "Bash", tool_input: { command: "ls" } }); ok(quiet(r), "hook: other tools are allowed");
+r = await hook(call("general-purpose", "p-depth"), { env: { SUBHUB_DEPTH: "1" } }); ok(quiet(r), "hook: inside a sub (SUBHUB_DEPTH) it allows");
+r = await hook(call("general-purpose", "p-env"), { env: { SUBHUB_HOOK: "0" } }); ok(quiet(r), "hook: SUBHUB_HOOK=0 turns it off");
+const cfg0 = rd(CFGF);
+fs.writeFileSync(CFGF, JSON.stringify({ ...JSON.parse(cfg0 || "{}"), hook: false })); r = await hook(call("general-purpose", "p-cfg")); ok(quiet(r), 'hook: "hook": false in config.json turns it off');
+r = await sh(["status"]); ok(/redirect hook: off/.test(r.out), "status shows the hook off", r.out);
+fs.writeFileSync(CFGF, JSON.stringify({ ...JSON.parse(cfg0 || "{}"), hook_types: ["code-reviewer"] }));
+r = await hook(call("code-reviewer", "p-ov")); const r2 = await hook(call("general-purpose", "p-ov2"));
+ok(denied(r) && quiet(r2), "hook: hook_types in config.json replaces the redirect list", JSON.stringify([r, r2]));
+if (cfg0 === null) fs.rmSync(CFGF, { force: true }); else fs.writeFileSync(CFGF, cfg0);
+r = await sh(["status", "--json"]); st = JSON.parse(r.out); ok(st.hook?.on === true && st.hook.types.includes("Explore") && st.hook.loaded === false, "status --json reports the hook", JSON.stringify(st.hook));
+r = await sh(["status"]); ok(/redirect hook: on/.test(r.out) && /plugin manager/.test(r.out), "status shows the hook on, and that it needs the plugin manager install", r.out);
+for (const [bad, name] of [["{not json", "bad JSON"], ["", "empty stdin"], ['{"tool_name":"Agent","tool_input":"x"}', "tool_input not an object"], ['{"tool_name":"Agent","tool_input":{"subagent_type":7,"prompt":{"a":1}},"surprise":[1]}', "odd and unknown fields"], ["[]", "a JSON array"]]) {
+  r = await hook(bad); ok(quiet(r), `hook: ${name} is allowed`, JSON.stringify(r));
+}
+// no usable sub: only the caller's own account (by email, or by its folder), the rest off, signed out or stopped
+const H2 = path.join(H, "home2"), REG2 = path.join(H2, ".subhub", "registry.json");
+const reg2 = (extra = []) => mk(REG2, JSON.stringify({ refreshed: Date.now(), subs: [
+  { name: "claude-1", provider: "claude", dir: "", email: "main@x.com", org: "org-main", label: "Claude Max", state: "ok" },
+  { name: "claude-2", provider: "claude", dir: path.join(H2, ".claude-b"), email: "b@x.com", org: "org-b", label: "Claude Pro", state: "ok" },
+  { name: "gemini-1", provider: "gemini", dir: "", email: "g@x.com", org: "google", label: "Google account", state: "signedout" },
+  { name: "ollama-1", provider: "ollama", dir: "", email: "this computer", org: "local", label: "Ollama", state: "stopped" }, ...extra] }));
+reg2(); mk(path.join(H2, ".subhub", "config.json"), JSON.stringify({ subs: { "claude-2": { on: false } }, order: [] }));
+r = await hook(call("general-purpose", "p-none"), { home: H2 }); ok(quiet(r), "hook: no usable sub (own account, off, signed out, stopped): allowed", JSON.stringify(r));
+r = await hook(call("general-purpose", "p-none"), { home: H2, env: { CLAUDE_CONFIG_DIR: path.join(H2, ".claude-b"), CLAUDE_CODE_USER_EMAIL: "Main@x.com", CLAUDE_CODE_ORGANIZATION_UUID: "org-main" } });
+ok(quiet(r), "hook: the caller's own account by email is not a usable sub");
+mk(path.join(H2, ".subhub", "config.json"), JSON.stringify({ subs: { "claude-1": { on: false } }, order: [] }));
+r = await hook(call("general-purpose", "p-own"), { home: H2, env: { CLAUDE_CONFIG_DIR: path.join(H2, ".claude-b") } }); ok(quiet(r), "hook: the caller's own account by folder is not a usable sub", JSON.stringify(r));
+r = await hook(call("general-purpose", "p-own"), { home: H2 }); ok(denied(r), "hook: another Claude account that is on and ok is a usable sub");
+reg2([{ name: "codex-1", provider: "codex", dir: "", email: "cx@x.com", org: "plus", label: "ChatGPT Plus", state: "ok" }]);
+r = await hook(call("general-purpose", "p-codex"), { home: H2, env: { CLAUDE_CONFIG_DIR: path.join(H2, ".claude-b") } }); ok(denied(r), "hook: a ready Codex sub makes it redirect");
+r = await hook(call("general-purpose", "p-x"), { home: path.join(H, "home3") }); ok(quiet(r), "hook: no registry at all: allowed", JSON.stringify(r));
+fs.writeFileSync(REG2, "{broken"); r = await hook(call("general-purpose", "p-y"), { home: H2 }); ok(quiet(r), "hook: unreadable registry: allowed");
+// the deny-once state is pruned by age
+const HS = path.join(H, ".subhub", "hook-denied.json"), hs = JSON.parse(rd(HS) || "{}");
+fs.writeFileSync(HS, JSON.stringify({ ...hs, stale: Date.now() - 2 * 86400000 })); await hook(call("general-purpose", "p-prune"));
+ok(!("stale" in JSON.parse(rd(HS) || "{}")) && Object.keys(JSON.parse(rd(HS))).length >= 1, "hook: deny-once entries older than a day are pruned");
+// speed: it runs before every sub-agent call
+const tm = (args, input) => { const ts = []; for (let i = 0; i < 5; i++) { const s = Date.now(); spawnSync(process.execPath, args, { input, env: { ...baseEnv, HOME: H, USERPROFILE: H }, windowsHide: true }); ts.push(Date.now() - s); } return ts.sort((a, b) => a - b)[2]; };
+const tNode = tm(["-e", ""]), tHook = tm([ENGINE, "hook", "pretool"], JSON.stringify(call("general-purpose", "p-time")));
+console.log(`      hook median ${tHook} ms (bare node start ${tNode} ms)`);
+ok(tHook < 1500 && tHook - tNode < 300, "hook: fast (median well under Node start-up + 300 ms)", `${tHook} ${tNode}`);
+// the plugin's agent and hooks files
+const agentMd = rd(path.join(PLUG, "agents", "relay.md")) || "", fm = agentMd.match(/^---\r?\n([\s\S]*?)\r?\n---/)?.[1] || "";
+const fmv = (k) => fm.match(new RegExp(`^${k}:\\s*(.*)$`, "m"))?.[1]?.trim();
+ok(fmv("name") === "relay" && fmv("model") === "haiku" && fmv("tools") === "Bash" && /^".*general-purpose.*"$/.test(fmv("description") || ""), "plugin agent agents/relay.md: name relay, haiku, Bash only, quoted description", fm.slice(0, 200));
+ok(/subhub ask --bg/.test(agentMd) && /subhub job wait <job id> 540/.test(agentMd) && /--continue/.test(agentMd) && /SUBHUB_RELAY_FAILED/.test(agentMd) && /at most ONE other sub/.test(agentMd), "relay agent: bg ask, bounded waits, follow-ups, one fallback, fixed failure line");
+let hj = null; try { hj = JSON.parse(rd(path.join(PLUG, "hooks", "hooks.json"))); } catch {}
+const hk = hj?.hooks?.PreToolUse?.[0], hcmd = hk?.hooks?.[0]?.command || "";
+ok(hk?.matcher === "Agent|Task" && hk.hooks[0].type === "command" && hcmd.includes('"${CLAUDE_PLUGIN_ROOT}/bin/subhub.mjs"') && /^node /.test(hcmd) && hcmd.endsWith(" hook pretool"), "plugin hooks/hooks.json: PreToolUse on Agent|Task runs node <plugin>/bin/subhub.mjs hook pretool", JSON.stringify(hj));
+const ran = spawnSync(hcmd.replace("${CLAUDE_PLUGIN_ROOT}", PLUG), { shell: true, input: JSON.stringify(call("general-purpose", "p-hookfile")), env: { ...baseEnv, HOME: H, USERPROFILE: H }, encoding: "utf8", windowsHide: true });
+ok(denied({ code: ran.status, out: ran.stdout }), "the hooks.json command line itself runs and denies", JSON.stringify([ran.status, ran.stdout, ran.stderr]));
+const ver = JSON.parse((await sh(["status", "--json"])).out).version;
+ok([path.join(PLUG, "plugin.json"), path.join(PLUG, ".claude-plugin", "plugin.json"), path.join(PLUG, ".codex-plugin", "plugin.json")].every((f) => JSON.parse(rd(f)).version === ver)
+  && [path.join(ROOT, ".claude-plugin", "marketplace.json"), path.join(ROOT, ".agents", "plugins", "marketplace.json")].every((f) => { const m = JSON.parse(rd(f)); return m.metadata.version === ver && m.plugins.every((p) => p.version === ver); }), `every manifest has the engine's version (${ver})`);
+
 // 6. agents: connect and disconnect (with the always-on rule in each agent's global rules file)
 const CMD = path.join(H, ".claude", "CLAUDE.md"), AMD = path.join(H, ".codex", "AGENTS.md"), GMD = path.join(H, ".gemini", "config", "AGENTS.md");
 const CMD0 = "# My rules\n\nUse tabs.", AMD0 = "# Codex rules\r\n\r\nBe brief.\r\n";
@@ -278,7 +348,7 @@ r = await sh(["connect", "all"]);
 ok(r.out.includes(`always-on rule in ${CMD}`) && r.out.includes(`always-on rule in ${GMD}`) && /Cursor: connected; no global rules file/.test(r.out), "connect says which file has the rule", r.out);
 for (const [f, orig, name] of [[CMD, CMD0, "Claude Code"], [AMD, AMD0, "Codex"]]) {
   const t = read(f) || "";
-  ok(t.startsWith(orig) && blocks(t) === 1 && t.includes("run `subhub list`") && t.trimEnd().endsWith("<!-- subhub:end -->"), `${name}: rule added after the existing content`, JSON.stringify(t.slice(0, 120)));
+  ok(t.startsWith(orig) && blocks(t) === 1 && t.includes("Run `subhub list` once per task") && t.trimEnd().endsWith("<!-- subhub:end -->"), `${name}: rule added after the existing content`, JSON.stringify(t.slice(0, 120)));
   ok(read(f + ".subhub-backup") === orig, `${name}: original backed up`);
 }
 ok(/\r\n<!-- subhub:start[^\n]*\r\n## /.test(read(AMD)), "Codex: CRLF file gets CRLF lines");
@@ -290,6 +360,12 @@ fs.writeFileSync(CMD, read(CMD).replace(/<!-- subhub:start[\s\S]*?<!-- subhub:en
 await sh(["connect", "claude"]); let t = read(CMD);
 ok(blocks(t) === 1 && !t.includes("old text") && t.includes("SUBHUB_DEPTH") && t.startsWith(CMD0) && t.endsWith("<!-- subhub:end -->\nafter\n"), "older block replaced in place", JSON.stringify(t));
 fs.writeFileSync(CMD, t.replace(/after\n$/, ""));
+ok(t.includes("try one other sub once") && t.includes("once per task") && !t.includes("subhub:relay") && !read(AMD).includes("subhub:relay"), "rule has the retry limit; no relay line without the Claude Code plugin install", JSON.stringify(t));
+const IPJ = path.join(H, ".claude", "plugins", "installed_plugins.json"); mk(IPJ, JSON.stringify({ version: 2, plugins: { "subhub@subhub": [{ scope: "user" }] } }));
+await sh(["connect", "claude"]); t = read(CMD);
+ok(blocks(t) === 1 && t.includes("subagent_type `subhub:relay`") && t.startsWith(CMD0) && !read(AMD).includes("subhub:relay"), "with the plugin installed, only the Claude Code rule names the relay agent, replaced in place", JSON.stringify(t));
+r = await sh(["status", "--json"]); ok(JSON.parse(r.out).hook.loaded === true, "status: hook loaded with the plugin installed");
+fs.rmSync(IPJ); await sh(["connect", "claude"]); ok(!read(CMD).includes("subhub:relay") && blocks(read(CMD)) === 1, "relay line goes again when the plugin isn't installed");
 r = await sh(["status", "--json"]); st = JSON.parse(r.out);
 const ag = Object.fromEntries(st.agents.map((a) => [a.id, a]));
 ok(ag.claude.rules === true && ag.claude.rulesFile === CMD && ag.codex.rules && ag.gemini.rules && ag.cursor.rules === false && ag.cursor.rulesFile === null && "connected" in ag.claude, "status --json reports the rule per agent", JSON.stringify(st.agents));

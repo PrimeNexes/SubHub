@@ -27,7 +27,7 @@ import crypto from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-const VERSION = "0.4.0-alpha";
+const VERSION = "0.5.0-alpha";
 const WIN = process.platform === "win32", MAC = process.platform === "darwin";
 const HOME = os.homedir();
 const SH = path.join(HOME, ".subhub"), REG = path.join(SH, "registry.json"), CFG = path.join(SH, "config.json");
@@ -319,13 +319,14 @@ function found(reg) {
 async function cmdStatus(args) {
   const reg = await fresh(args.includes("--refresh"));
   const agents = AGENTS.map((a) => ({ id: a, name: AGENT_NAME[a], installed: !!binFor(a), connected: agentOn(a), rules: !!rulesIn(a), rulesFile: rulesIn(a) || RULE_FILES[a]()[0] || null }));
-  const f = found(reg);
+  const f = found(reg), h = hookCfg(), hook = { on: h.on, types: h.types, loaded: claudePlugin() };
   if (args.includes("--json")) {
-    console.log(JSON.stringify({ version: VERSION, subs: reg.subs.map((s) => ({ name: s.name, provider: s.provider, folder: s.dir, email: s.email, label: s.label, state: s.state, on: isOn(s.name) })), agents, found: f }));
+    console.log(JSON.stringify({ version: VERSION, subs: reg.subs.map((s) => ({ name: s.name, provider: s.provider, folder: s.dir, email: s.email, label: s.label, state: s.state, on: isOn(s.name) })), agents, hook, found: f }));
     return;
   }
   console.log("Subs:"); for (const s of reg.subs) console.log(`  ${s.name.padEnd(10)} ${s.email.padEnd(28)} ${s.label.padEnd(26)} ${isOn(s.name) ? s.state : "off"}`);
   console.log("Agents:"); for (const a of agents) console.log(`  ${a.name.padEnd(12)} ${!a.installed ? "not installed" : a.connected ? "connected" : `not connected (subhub connect ${a.id})`}${a.rules ? `, always-on rule in ${a.rulesFile}` : ""}`);
+  console.log(`Claude Code redirect hook: ${hook.on ? "on" : "off"} (${hook.types.map((t) => t || "no type").join(", ") || "no types"} → ${RELAY}; "hook": false in ${CFG} or SUBHUB_HOOK=0 turns it off)${hook.loaded ? "" : ". The relay agent and the hook load only with the plugin installed through Claude Code's plugin manager, which it isn't"}`);
   if (f.length) { console.log("Found, not signed in (subhub signin claude --new --email <email>):"); for (const x of f) console.log(`  ${x.email} · ${["team", "enterprise"].includes(x.type) ? "Team " + x.orgName : "Personal"}`); }
 }
 
@@ -335,6 +336,14 @@ const CALLER_VARS = ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSIO
   "CLAUDE_CODE_OAUTH_REFRESH_TOKEN", "CLAUDE_CODE_OAUTH_SCOPES", "CLAUDE_CODE_SESSION_ACCESS_TOKEN", "CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH",
   "CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH", "CLAUDE_CODE_SDK_HAS_SESSIONS_OAUTH_REFRESH", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN",
   "CLAUDE_CODE_HOST_AUTH_ENV_VAR", "CLAUDE_CODE_HOST_CREDS_FILE"];
+/** Whether a Claude sub is the account the calling Claude Code session runs as (from that session's environment): why, or "". */
+function isCaller(s, env = process.env, inClaude = !!env.CLAUDECODE) {
+  if (s.provider !== "claude") return "";
+  const caller = env.CLAUDE_CODE_USER_EMAIL ? `${env.CLAUDE_CODE_USER_EMAIL.toLowerCase()}|${env.CLAUDE_CODE_ORGANIZATION_UUID || ""}` : "";
+  if (caller && caller === `${s.email}|${s.org}`) return "the account you're running as";
+  if (inClaude && real(env.CLAUDE_CONFIG_DIR || path.join(HOME, ".claude")) === real(s.dir || path.join(HOME, ".claude"))) return "the Claude account you're running as";
+  return "";
+}
 const readStdin = () => { try { return process.stdin.isTTY ? "" : fs.readFileSync(0, "utf8"); } catch { return ""; } };
 function gitSnap(cwd) {
   const st = run("git", ["status", "--porcelain", "-uall"], { cwd }); if (st.code !== 0) return null;
@@ -360,10 +369,8 @@ async function cmdAsk(argv) {
     [name, model = "default", task = ""] = args; if (opt["--model"]) model = opt["--model"];
   }
   if (!task) task = opt["--brief-file"] ? fs.readFileSync(expand(opt["--brief-file"]), "utf8") : readStdin();
-  // Who is calling: a Claude Code session says so in its environment. Any agent may call.
+  // Who is calling: a Claude Code session says so in its environment (isCaller). Any agent may call.
   const env = { ...process.env };
-  const caller = env.CLAUDE_CODE_USER_EMAIL ? `${env.CLAUDE_CODE_USER_EMAIL.toLowerCase()}|${env.CLAUDE_CODE_ORGANIZATION_UUID || ""}` : "";
-  const inClaude = !!env.CLAUDECODE, callerDir = env.CLAUDE_CONFIG_DIR || "";
   for (const v of CALLER_VARS) delete env[v];          // a sub uses its own sign-in, never the caller's
   const max = +env.SUBHUB_MAX_DEPTH || 1, depth = +env.SUBHUB_DEPTH || 0;
   if (depth >= max) die(3, `loop guard: depth ${max} reached`);
@@ -400,8 +407,7 @@ async function cmdAsk(argv) {
   } else {
     const bin = binFor(s.provider) || die(127, `${name}'s CLI isn't installed.`);
     if (s.provider === "claude") {
-      if (caller && caller === `${s.email}|${s.org}`) die(6, `${name} is the account you're running as. Pick another sub.`);
-      if (inClaude && real(callerDir || path.join(HOME, ".claude")) === real(s.dir || path.join(HOME, ".claude"))) die(6, `${name} is the Claude account you're running as. Pick another sub.`);
+      const me = isCaller(s); if (me) die(6, `${name} is ${me}. Pick another sub.`);
       const w = claudeWho(bin, s.dir); if (!w || `${w.email}|${w.org}` !== `${s.email}|${s.org}`) die(10, `${name} isn't signed in as ${s.email} any more. Sign it in again: subhub signin ${name}`);
       Object.assign(env, envFor("claude", s.dir, env)); delete env.ANTHROPIC_API_KEY; delete env.ANTHROPIC_AUTH_TOKEN;
       env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = "1";   // documented: no background commands or agents for a headless sub
@@ -825,8 +831,10 @@ const codexHome = () => process.env.CODEX_HOME || path.join(HOME, ".codex");
 const SKILL_DIR = { codex: () => path.join(codexHome(), "skills", "subhub"), gemini: () => path.join(HOME, ".gemini", "config", "skills", "subhub"), cursor: () => path.join(HOME, ".cursor", "skills", "subhub") };
 const launcher = () => path.join(BIN, WIN ? "subhub.cmd" : "subhub");
 const RULES = () => ["subhub", launcher()];
+/** Claude Code has SubHub through its plugin manager (so the relay agent and the redirect hook load), not only the skills-folder copy. */
+const claudePlugin = () => JSON.stringify(readJSON(path.join(HOME, ".claude", "plugins", "installed_plugins.json")) || "").includes('"subhub@');
 function agentOn(a) {
-  if (a === "claude") return JSON.stringify(readJSON(path.join(HOME, ".claude", "plugins", "installed_plugins.json")) || "").includes('"subhub@') || pexist(path.join(HOME, ".claude", "skills", "subhub", "bin", "subhub.mjs"));
+  if (a === "claude") return claudePlugin() || pexist(path.join(HOME, ".claude", "skills", "subhub", "bin", "subhub.mjs"));
   if (a === "codex") return pexist(path.join(codexHome(), "plugins", "cache", "subhub")) || pexist(path.join(SKILL_DIR.codex(), "SKILL.md"));
   if (a === "gemini") return pexist(path.join(HOME, ".gemini", "config", "plugins", "subhub")) || pexist(path.join(SKILL_DIR.gemini(), "SKILL.md"));
   return pexist(path.join(SKILL_DIR.cursor(), "SKILL.md"));
@@ -848,11 +856,15 @@ function allow(add, file, rule) {
 const RULE_START = "<!-- subhub:start", RULE_END = "<!-- subhub:end -->", RULE_STATE = path.join(SH, "rules.json");
 const RULE_BLOCK = [`${RULE_START} v${VERSION}: written by SubHub, removed by subhub disconnect -->`,
   "## Use the user's other AI subscriptions (SubHub) first",
-  "- Before starting a built-in sub-agent, or doing delegable side work (wide file reads, research, reviews, independent edits, parallel pieces), run `subhub list` and hand the work to a ready sub with `subhub ask` (details in the subhub skill). This saves this account's usage.",
+  "- Before starting a built-in sub-agent, or doing delegable side work (wide file reads, research, reviews, independent edits, parallel pieces), hand the work to a ready sub with `subhub ask` (details in the subhub skill). This saves this account's usage. Run `subhub list` once per task, not before every step.",
   "- Do it yourself or with built-in sub-agents only when `subhub list` shows no ready sub, the task is a few tool calls, the work needs this conversation's context that can't be put in a brief, or the brief would have to contain secrets.",
+  "- If a sub fails, stalls or reports a usage limit, try one other sub once, then do the work yourself. Never retry the same sub in a loop.",
   "- If you are running as a sub yourself (the brief says you are a sub-agent, or SUBHUB_DEPTH is set), don't delegate.",
   "- Run `subhub` as the whole command, with nothing chained before or after it.",
   RULE_END];
+const RULE_CLAUDE = "- In Claude Code, delegate with the Agent tool and subagent_type `subhub:relay` (it passes your prompt to a sub and returns the answer), not general-purpose or Explore.";
+/** The block for one agent: Claude Code with the plugin installed (so the relay agent exists) also gets the relay line. */
+const ruleBlock = (a) => a === "claude" && claudePlugin() ? [...RULE_BLOCK.slice(0, 3), RULE_CLAUDE, ...RULE_BLOCK.slice(3)] : RULE_BLOCK;
 const nonEmpty = (f) => { try { return fs.readFileSync(f, "utf8").trim() !== ""; } catch { return false; } };
 const RULE_FILES = {   // every file SubHub may have put the block in; the first is where connect writes it
   claude: () => [path.join(HOME, ".claude", "CLAUDE.md")],
@@ -868,8 +880,8 @@ function findBlock(text) {
 const readText = (f) => { try { return fs.readFileSync(f, "utf8"); } catch { return null; } };
 const rulesIn = (a) => RULE_FILES[a]().find((f) => findBlock(readText(f) || "")) || null;
 /** Writes (or refreshes in place) the block. Everything else in the file stays byte for byte; writes through symlinks. */
-function addRules(file) {
-  const old = readText(file), text = old ?? "", eol = text.includes("\r\n") ? "\r\n" : "\n", block = RULE_BLOCK.join(eol), at = findBlock(text);
+function addRules(file, a) {
+  const old = readText(file), text = old ?? "", eol = text.includes("\r\n") ? "\r\n" : "\n", block = ruleBlock(a).join(eol), at = findBlock(text);
   let next;
   if (at) next = text.slice(0, at[0]) + block + text.slice(at[1]);
   else {
@@ -920,7 +932,7 @@ function connect(a, rules = !process.env.SUBHUB_NO_RULES) {
   }
   let note = "";
   if (!RULE_FILES[a]().length) note = "; no global rules file to write the always-on rule to (skill only)";
-  else if (rules) { const f = RULE_FILES[a]()[0]; addRules(f); note = `; always-on rule in ${f}`; }
+  else if (rules) { const f = RULE_FILES[a]()[0]; addRules(f, a); note = `; always-on rule in ${f}`; }
   else note = "; always-on rule skipped";
   console.log(`  ${AGENT_NAME[a]}: connected${note}`);
 }
@@ -1013,6 +1025,42 @@ function cmdOnOff(on, name) {
   console.log(`${name} is ${on ? "on" : "off"}.`);
 }
 
+// ---------------------------------------------------------------- Claude Code redirect hook (plugin hooks/hooks.json: PreToolUse on Agent|Task)
+// `subhub hook pretool` reads the hook JSON on stdin. When Claude is about to start a generic built-in sub-agent and a sub is
+// ready, it denies that call once with a pointer to the relay agent; the same call again (same session and prompt) goes ahead.
+// Anything else, or any error, prints nothing: the call goes ahead. Reads only registry.json and config.json: no spawns, no network.
+const RELAY = "subhub:relay", HOOK_TYPES = ["general-purpose", "Explore", "claude", ""], HOOK_STATE = path.join(SH, "hook-denied.json");
+/** Whether the redirect hook is on (config "hook": false or SUBHUB_HOOK=0 turn it off) and the agent types it redirects ("hook_types"; "" = no type). */
+function hookCfg(c = cfg()) {
+  const e = process.env.SUBHUB_HOOK;
+  return { on: e !== undefined && e !== "" ? !/^(0|off|false|no)$/i.test(e) : c.hook !== false,
+    types: Array.isArray(c.hook_types) ? c.hook_types.filter((t) => typeof t === "string") : HOOK_TYPES };
+}
+const HOOK_REASON = "SubHub: hand this to one of the user's other AI subscriptions instead, to save this account's usage. "
+  + `Call the Agent tool again with subagent_type "${RELAY}" and the same prompt; it relays the prompt verbatim to a ready sub and returns the answer and a job id. `
+  + "To pick the sub, make the prompt's first line `use: <sub> [model]` (`subhub list` shows them); for a follow-up, `continue: <job id>`. "
+  + "If the task needs this conversation's context or secrets, or the relay failed, repeat this exact call: it will be allowed.";
+function cmdHook(args) {
+  try {
+    if (args[0] !== "pretool" || process.env.SUBHUB_DEPTH) return;   // inside a sub: never redirect
+    const c = readJSON(CFG) || {}, h = hookCfg(c); if (!h.on) return;
+    const inp = JSON.parse(readStdin()), ti = inp?.tool_input;
+    if (!["Agent", "Task"].includes(inp?.tool_name) || !ti || typeof ti !== "object") return;
+    if (ti.subagent_type != null && typeof ti.subagent_type !== "string") return;   // a shape this hook doesn't know
+    const type = (ti.subagent_type || "").trim();
+    if (type === RELAY || !h.types.some((t) => t.trim().toLowerCase() === type.toLowerCase())) return;
+    const subs = readJSON(REG)?.subs; if (!Array.isArray(subs)) return;
+    if (!subs.some((s) => s && c.subs?.[s.name]?.on !== false && s.state === "ok" && !isCaller(s, process.env, true))) return;
+    const key = crypto.createHash("sha1").update(`${inp.session_id || ""}\0${typeof ti.prompt === "string" ? ti.prompt : JSON.stringify(ti.prompt ?? "")}`).digest("hex");
+    const now = Date.now(), old = readJSON(HOOK_STATE), st = {};
+    for (const [k, t] of Object.entries(old && typeof old === "object" ? old : {})) if (typeof t === "number" && now - t < 86400000) st[k] = t;   // a day
+    const again = !!st[key]; if (!again) st[key] = now;
+    const tmp = `${HOOK_STATE}.${process.pid}.t`; fs.writeFileSync(tmp, JSON.stringify(st)); fs.renameSync(tmp, HOOK_STATE);
+    if (again) return;   // denied once already: the escape hatch, so there's never a deny loop
+    fs.writeSync(1, JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: HOOK_REASON } }) + "\n");
+  } catch {}
+}
+
 // ---------------------------------------------------------------- main
 const [cmd, ...rest] = process.argv.slice(2);
 const flags = rest.filter((x) => x.startsWith("--")), words = rest.filter((x) => !x.startsWith("--"));
@@ -1033,8 +1081,9 @@ switch (cmd) {
   case "signin": await cmdSignin(rest); break;
   case "remove": cmdRemove(rest[0]); break;
   case "on": case "off": cmdOnOff(cmd === "on", rest[0]); break;
-  case "config": console.log(`${CFG}:\n` + (pexist(CFG) ? fs.readFileSync(CFG, "utf8") : '(none yet: {"subs":{"<sub>":{"on":true,"use_for":"","model":"default","notes":""}},"order":[]})')); break;
+  case "config": console.log(`${CFG}:\n` + (pexist(CFG) ? fs.readFileSync(CFG, "utf8") : '(none yet: {"subs":{"<sub>":{"on":true,"use_for":"","model":"default","notes":""}},"order":[],"hook":true})')); break;
   case "ollama": await cmdOllama(rest); break;
+  case "hook": cmdHook(rest); break;
   case "version": case "--version": console.log(`subhub ${VERSION}`); break;
   default: { const ls = fs.readFileSync(SELF, "utf8").split("\n"); console.log(ls.slice(1, ls.findIndex((l) => l.startsWith("import "))).map((l) => l.replace(/^\/\/ ?/, "")).join("\n")); }
 }

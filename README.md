@@ -15,7 +15,7 @@ You pay for several AI subscriptions: a second Claude account, a team and a pers
 - parallel side work
 - carrying on after a usage limit
 
-SubHub is a plugin with two skills, for Claude Code, Codex and Antigravity, and for Cursor through its skills folder. It runs on **macOS, Linux and Windows**. One Node.js file, `subhub.mjs`, does the work, using only Node's built-in modules. There's no server and no daemon: state is plain files in `~/.subhub`, and a background job is one process that ends with the job.
+SubHub is a plugin with two skills (plus a relay agent and a redirect hook in Claude Code), for Claude Code, Codex and Antigravity, and for Cursor through its skills folder. It runs on **macOS, Linux and Windows**. One Node.js file, `subhub.mjs`, does the work, using only Node's built-in modules. There's no server and no daemon: state is plain files in `~/.subhub`, and a background job is one process that ends with the job.
 
 ## Install
 
@@ -42,7 +42,7 @@ Both need [Node.js](https://nodejs.org) 18 or newer. On Windows, `winget install
 
 ### Always-on rule
 
-A skill only loads when the agent decides a task matches it, so agents often fall back to their built-in sub-agents and spend the calling account's usage. To make subs the default, `subhub connect` (and so `subhub install`) adds a block of about six lines to the agent's global, all-projects rules file. The block tells the agent to run `subhub list` and hand delegable work to a ready sub before starting a built-in sub-agent, except for tiny tasks, work that needs the conversation's context, briefs that would contain secrets, or when it is itself a sub.
+A skill only loads when the agent decides a task matches it, so agents often fall back to their built-in sub-agents and spend the calling account's usage. To make subs the default, `subhub connect` (and so `subhub install`) adds a block of about seven lines to the agent's global, all-projects rules file. The block tells the agent to hand delegable work to a ready sub before starting a built-in sub-agent (running `subhub list` once per task), except for tiny tasks, work that needs the conversation's context, briefs that would contain secrets, or when it is itself a sub. If a sub fails, the agent tries one other sub once and then does the work itself; it never retries the same sub in a loop. In Claude Code with the plugin installed, the block has one more line pointing at the relay agent (below).
 
 | Agent | File |
 |---|---|
@@ -56,6 +56,16 @@ The block sits between `<!-- subhub:start … -->` and `<!-- subhub:end -->`. Su
 - **Skip it:** `subhub connect <agent> --no-rules`, `subhub install --no-rules`, or `SUBHUB_NO_RULES=1` for the one-line installers (`curl -fsSL …/install.sh | SUBHUB_NO_RULES=1 sh`, or `$env:SUBHUB_NO_RULES=1` before `irm … | iex`).
 - **Remove it:** `subhub disconnect <agent>` takes the block out and leaves the rest of the file as it was (a file SubHub created is deleted). Or delete the marked lines yourself.
 - `subhub status` shows which agents have the rule.
+
+### Claude Code: relay agent and redirect hook
+
+Claude Code's built-in Agent tool is one native tool call, while a rule and a skill are several steps, so Claude Code tends to start its own sub-agents anyway. The plugin adds two things for Claude Code only:
+
+- **The `subhub:relay` agent** (`plugins/subhub/agents/relay.md`). Claude starts it with its Agent tool, in one call, like any sub-agent. It runs on Haiku with only the Bash tool, and only relays: it passes the prompt verbatim to a sub with `subhub ask --bg`, waits with `subhub job wait`, and returns the sub's answer, the changed-files note and the job id. To pick the sub, the prompt's first line is `use: <sub> [model]`; for a follow-up to an earlier relay job, `continue: <job id> [model]`. Without one, it picks the first ready sub that fits from `subhub list`. If the sub fails, stalls or is at its usage limit, it tries one other sub once, then returns a line starting `SUBHUB_RELAY_FAILED:` that tells Claude to do the work itself.
+- **A redirect hook** (`plugins/subhub/hooks/hooks.json`, `PreToolUse` on `Agent|Task`, which runs `node <plugin>/bin/subhub.mjs hook pretool`). When Claude is about to start a generic built-in sub-agent (`general-purpose`, `Explore`, the `claude` catch-all, or a call with no type) and a sub is ready, the hook blocks that call once and tells Claude to use `subhub:relay`. Repeating the same call (same session, same prompt) goes ahead, so it can never loop. It never touches custom or plugin agents, `Plan`, forks or the relay itself, does nothing inside a sub, when no sub is ready (on, signed in, and not the account Claude runs as), or on any error. It reads only `~/.subhub/registry.json` and `config.json`: no network, no CLI runs; it costs about 10 ms on top of Node's start-up.
+- **Turn the hook off:** `"hook": false` in `~/.subhub/config.json`, or `SUBHUB_HOOK=0` in Claude Code's environment. `"hook_types": [...]` changes which agent types it redirects. `subhub status` shows whether it's on.
+
+Both load only when SubHub is installed through Claude Code's plugin manager (`subhub connect claude` tries that first). If that fails, `subhub connect claude` copies the plugin folder into `~/.claude/skills/subhub` instead; there Claude Code loads the skills only, **not the relay agent and not the hook**, and the always-on rule leaves out the relay line. Codex, Antigravity and Cursor keep the rule and the skill only.
 
 Or install the plugin through each agent's own plugin manager:
 
@@ -175,6 +185,8 @@ plugins/subhub/
   plugin.json                     Antigravity plugin
   skills/subhub/SKILL.md          delegate to a sub (Agent Skills format)
   skills/subhub-config/SKILL.md   settings and setup
+  agents/relay.md                 Claude Code: the subhub:relay agent
+  hooks/hooks.json                Claude Code: the redirect hook (subhub hook pretool)
   bin/subhub.mjs                  the engine (Node.js 18+, built-in modules only)
   bin/subhub, bin/subhub.cmd      launchers for macOS/Linux and Windows
 test/smoke.mjs                    test against stand-in CLIs and a stand-in Ollama (CI: macOS, Linux, Windows)
