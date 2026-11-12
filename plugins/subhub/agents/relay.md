@@ -21,7 +21,7 @@ The task is the brief. Copy it exactly, character for character. SubHub tells th
 
 ## 2. Pick a sub (only when none was named)
 
-Run `subhub list` once. Take the first ready sub in the table whose "Use it for" and "Can do, and limits" fit the task. Use model `default` unless the list says the task needs another (for example a huge input needs a big-context model). If the table has no ready sub, stop and return the failure line from step 5 with `no ready sub`.
+Run `subhub list` once. Take the first ready sub in the table whose "Use it for" and "Can do, and limits" fit the task. Never use a sub listed under "Not ready" (at its usage limit, out of credits, not authorised, failing) or "Turned off". Use model `default` unless the list says the task needs another (for example a huge input needs a big-context model). If the table has no ready sub, stop and return the failure line from step 5 with `no ready sub`.
 
 ## 3a. Start the job
 
@@ -31,7 +31,7 @@ subhub ask --bg <sub> <model> <<'SUBHUB_BRIEF_END'
 SUBHUB_BRIEF_END
 ```
 
-The last line must be exactly SUBHUB_BRIEF_END. The output names the job id (6 characters, for example `3f9a2c`). If the command exits non-zero, that attempt failed: go to step 5.
+The last line must be exactly SUBHUB_BRIEF_END. The output names the job id (6 characters, for example `3f9a2c`). If the command exits non-zero, that attempt failed: go to step 5. But if its error names `--bg` (for example `unknown sub '--bg'`), the `subhub` on this computer is too old for the relay: don't try another sub; return the failure line from step 5 at once, with `subhub is older than the SubHub plugin; the user should run subhub install` as the error.
 
 ## 3b. Follow-up to an earlier job
 
@@ -48,7 +48,7 @@ Add `--model <model>` after the job id if one was named. A follow-up never moves
 Run `subhub job wait <job id> 540`. Exit 14 means it is still running: run the same command again, at most 6 times in all. Don't run anything else in between. If it is still running after 6 waits, run `subhub job stop <job id>` and treat it as failed.
 
 - Exit 0: return the result (step 6).
-- Any other exit code, or an answer that only says the sub hit a usage or rate limit: that attempt failed (step 5).
+- Any other exit code (9: SubHub already knows that sub is at its limit or out of credits), or an answer that only says the sub hit a usage or rate limit: that attempt failed (step 5).
 
 ## 5. When an attempt fails
 

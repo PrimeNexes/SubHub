@@ -33,12 +33,13 @@ irm https://raw.githubusercontent.com/PrimeNexes/SubHub/main/install.ps1 | iex
 
 Both need [Node.js](https://nodejs.org) 18 or newer. On Windows, `winget install OpenJS.NodeJS.LTS` installs it.
 
-`subhub install` does five things:
+`subhub install` does six things:
 - puts `subhub` in `~/.local/bin`
 - finds every AI account you're signed in to
 - installs the plugin into each agent that's installed
 - adds one permission rule per agent, so the agent can run `subhub` without asking
 - adds a short always-on rule to each agent's global rules file (see below), and prints which file it wrote
+- checks which subs actually work (see [Which subs actually work](#which-subs-actually-work)): this sends one tiny test prompt to each sub that has no free check, so it uses a little of their usage. `subhub install --no-check` (or `SUBHUB_NO_CHECK=1`) skips it
 
 ### Always-on rule
 
@@ -62,7 +63,7 @@ The block sits between `<!-- subhub:start … -->` and `<!-- subhub:end -->`. Su
 Claude Code's built-in Agent tool is one native tool call, while a rule and a skill are several steps, so Claude Code tends to start its own sub-agents anyway. The plugin adds two things for Claude Code only:
 
 - **The `subhub:relay` agent** (`plugins/subhub/agents/relay.md`). Claude starts it with its Agent tool, in one call, like any sub-agent. It runs on Haiku with only the Bash tool, and only relays: it passes the prompt verbatim to a sub with `subhub ask --bg`, waits with `subhub job wait`, and returns the sub's answer, the changed-files note and the job id. To pick the sub, the prompt's first line is `use: <sub> [model]`; for a follow-up to an earlier relay job, `continue: <job id> [model]`. Without one, it picks the first ready sub that fits from `subhub list`. If the sub fails, stalls or is at its usage limit, it tries one other sub once, then returns a line starting `SUBHUB_RELAY_FAILED:` that tells Claude to do the work itself.
-- **A redirect hook** (`plugins/subhub/hooks/hooks.json`, `PreToolUse` on `Agent|Task`, which runs `node <plugin>/bin/subhub.mjs hook pretool`). When Claude is about to start a generic built-in sub-agent (`general-purpose`, `Explore`, the `claude` catch-all, or a call with no type) and a sub is ready, the hook blocks that call once and tells Claude to use `subhub:relay`. Repeating the same call (same session, same prompt) goes ahead, so it can never loop. It never touches custom or plugin agents, `Plan`, forks or the relay itself, does nothing inside a sub, when no sub is ready (on, signed in, and not the account Claude runs as), or on any error. It reads only `~/.subhub/registry.json` and `config.json`: no network, no CLI runs; it costs about 10 ms on top of Node's start-up.
+- **A redirect hook** (`plugins/subhub/hooks/hooks.json`, `PreToolUse` on `Agent|Task`, which runs `node <plugin>/bin/subhub.mjs hook pretool`). When Claude is about to start a generic built-in sub-agent (`general-purpose`, `Explore`, the `claude` catch-all, or a call with no type) and a sub is ready, the hook blocks that call once and tells Claude to use `subhub:relay`. Repeating the same call (same session, same prompt) goes ahead, so it can never loop. It never touches custom or plugin agents, `Plan`, forks or the relay itself, does nothing inside a sub, when no sub is ready (on, signed in, working or not yet checked, and not the account Claude runs as), when the `subhub` on PATH is missing or a different version from the plugin (the relay would call commands it doesn't have), or on any error. It reads only `~/.subhub/registry.json`, `config.json` and the version line of `~/.subhub/bin/subhub.mjs`: no network, no CLI runs; it costs about 10 ms on top of Node's start-up.
 - **Turn the hook off:** `"hook": false` in `~/.subhub/config.json`, or `SUBHUB_HOOK=0` in Claude Code's environment. `"hook_types": [...]` changes which agent types it redirects. `subhub status` shows whether it's on.
 
 Both load only when SubHub is installed through Claude Code's plugin manager (`subhub connect claude` tries that first). If that fails, `subhub connect claude` copies the plugin folder into `~/.claude/skills/subhub` instead; there Claude Code loads the skills only, **not the relay agent and not the hook**, and the always-on rule leaves out the relay line. Codex, Antigravity and Cursor keep the rule and the skill only.
@@ -124,6 +125,32 @@ SubHub checks each CLI's `--help` for these flags; a CLI without them, or a stre
 
 **Stalls.** Every brief tells the sub to run commands in the foreground and never leave background tasks running, because nobody collects them in a headless run (Claude subs also run with `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`). If a sub shows no activity for 15 minutes (`SUBHUB_IDLE` seconds, `0` turns it off), SubHub stops it as stalled (exit 12); a line that only repeats, like `waiting for 1 background task(s) to finish`, doesn't count as activity. 15 minutes is longer than one long command: Claude Code's Bash tool stops a command at 10 minutes. `SUBHUB_PLAIN=1` turns streaming off.
 
+## Which subs actually work
+
+Signed in isn't the same as working: a plan can be out of credits, an account at its usage limit until some time, a subscription lapsed, or a CLI signed in but refused in headless runs (Cursor's `status` can say "Logged in" while a run says "Authentication required"). SubHub keeps a health record with each sub: **working**, **at its usage limit** (with the reset time when the CLI names one), **out of credits or no plan**, **not authorised for headless runs**, **failing** (with the CLI's last error line), or **unknown** (not checked yet).
+
+- **Learned for free from every real `subhub ask`.** A normal answer marks the sub working; a limit, credits or sign-in error marks it so, with the reset time. This is the main source in daily use.
+- **`subhub list`** puts only working and unknown subs in the ready table; the rest go under "Not ready" with the reason, for example `claude-2 (at its usage limit until 21:40: You've hit your limit · resets 9:40pm)`. Once a reset time passes the sub counts as unknown again and is simply tried; an unrecognised failure is retried after 30 minutes, and a limit with no reset time after an hour.
+- **`subhub ask`** to a sub known to be at its limit (reset still ahead) or out of credits fails at once with **exit 9** and the reason, without starting the CLI. `subhub ask --force …` tries anyway.
+- **`subhub status`** (and `--json`) shows each sub's health and when it was last seen. The redirect hook and the relay agent skip subs that aren't working.
+- **`subhub check [sub…] [--json]`** re-tests every sub (or the named ones) in parallel and prints sub, account, result, reset time and reason. It runs free checks first and a test prompt only where those can't prove the sub works. It never tests the account you're running as ("this is you, not checked"), never starts Ollama, and never downloads a model.
+
+| Sub | Free checks (no prompt, no usage) | Test prompt still needed? |
+|---|---|---|
+| Claude Code | `claude auth status` (signed in, plan) | yes: Claude Code has no non-interactive usage command (`/usage` is interactive). `claude -p … --model haiku` |
+| Codex | `codex login status`; `codex app-server` → `account/read` and `account/rateLimits/read` (each window's % used and reset time) | only if the app server gives no rate limits |
+| Cursor | `cursor-agent status`, `--list-models` | yes: no usage command, and `status` can say logged in while headless runs are refused. Model `auto` |
+| Antigravity | `agy models` | yes: quota is only in the interactive `/usage`. The cheapest Flash model from `agy models` |
+| Ollama | `/api/tags`, `/api/show` (running, models); `https://ollama.com/api/balance` for cloud credits when `OLLAMA_API_KEY` is set | no for local models (they're free); only for cloud-only setups without `OLLAMA_API_KEY` |
+
+**What a check costs.** SubHub never spends your usage on its own. A test prompt is one tiny headless prompt per sub ("Reply with exactly one word: PONG") on that sub's cheapest model, in an empty temporary folder, with a 75-second limit, through the same path as a normal ask (same account, pins and flags). Only `subhub check`, `subhub list --refresh` and `subhub install` (`--no-check` skips it) send one. Plain `list`, `status`, the hook and `ask` never do.
+
+The messages SubHub recognises (usage limits, rate limits, credits, payment, sign-in, for each CLI) are one table in `subhub.mjs` (`HEALTH_PATTERNS`), easy to extend; anything unrecognised counts as failing.
+
+## Engine and plugin versions
+
+Agents load the plugin (skills, relay agent, hook) from their own plugin copy, while `subhub` on PATH is the engine `subhub install` copied to `~/.subhub/bin`. If they differ, for example after a plugin update without `subhub install`, `subhub status` warns and names the fix (`subhub install` from the newer copy), and the redirect hook stays off until they match, so Claude Code is never sent to a relay that can't work.
+
 ## Accounts
 
 `subhub status` shows every sub, every agent, and accounts found on this computer that aren't signed in yet.
@@ -144,7 +171,7 @@ To add another Claude account or organization: `subhub signin claude --new --ema
 - **An agent never gets its own account as a sub** (exit 6).
 - **Subs use their own sign-in, never the caller's.** SubHub drops the caller's session and token variables before starting a sub.
 - **Subs run with full access, in the folder you call from.** The calling agent says in the brief what each sub may change. After each run in a git repo, SubHub lists the files that changed.
-- **SubHub never starts, downloads or signs in to anything by itself.** It never starts Ollama and never downloads a model.
+- **SubHub never starts, downloads or signs in to anything by itself.** It never starts Ollama and never downloads a model. It spends a sub's usage only when an agent asks it to, or for the tiny test prompt of `subhub check`, `subhub list --refresh` and `subhub install`.
 - **There's a loop guard,** so a sub can't delegate further. Every run has a 30-minute timeout (`SUBHUB_TIMEOUT` seconds) and is stopped earlier if it shows no activity for 15 minutes (`SUBHUB_IDLE`); either way SubHub stops the sub's whole process tree, and the job can be continued with `subhub ask --continue <id>`.
 
 ## Ollama
@@ -166,7 +193,7 @@ SubHub never starts Ollama or downloads models.
 
 ## Settings
 
-`~/.subhub/config.json` holds, per sub: on/off, what it's for, its default model, and notes added to every brief. A top-level `order` sets the order agents try subs in. Ask your agent to "change my SubHub settings" (the `subhub-config` skill), or run:
+`~/.subhub/config.json` holds, per sub: on/off, what it's for, its default model, and notes added to every brief. A top-level `order` sets the order agents try subs in. A top-level `notes` is added to every brief for every sub (for example an answer style, so subs reply as tersely as your main agent). Ask your agent to "change my SubHub settings" (the `subhub-config` skill), or run:
 
 ```sh
 subhub on|off <sub>

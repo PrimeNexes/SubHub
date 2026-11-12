@@ -3,14 +3,19 @@
 // One file, Node.js 18+ built-ins only, macOS / Linux / Windows. No daemon: it finds every signed-in AI
 // account, keeps a small registry, and runs a sub on request. https://github.com/PrimeNexes/SubHub · MIT
 //
-//   subhub list [--refresh]            the subs, what each is for, its limits and models (agents read this)
+//   subhub list [--refresh]            the ready subs, what each is for, its limits and models (agents read this);
+//                                      --refresh also re-tests every sub, like check
+//   subhub check [sub…] [--json]       which subs actually work: free CLI checks (auth, rate limits), then one tiny test
+//                                      prompt per sub where those can't tell (costs a little usage; only check, install
+//                                      and list --refresh ever do this). ask learns it from every real run for free
 //   subhub models <sub>                every model that sub offers
-//   subhub ask [--bg] [--in <folder>] <sub> <model|default> [brief | --brief-file <file> | brief on stdin]
+//   subhub ask [--bg] [--force] [--in <folder>] <sub> <model|default> [brief | --brief-file <file> | brief on stdin]
+//                                      (--force: try a sub known to be at its limit or out of credits anyway)
 //   subhub ask [--bg] --continue <job> [--model M] [brief]   a follow-up in the same sub conversation
 //   subhub jobs [--json] · subhub job <id> [--json] · subhub job tail <id> [n] · subhub job result <id>
 //   subhub job wait <id> [seconds] · subhub job stop <id>      every ask is a job in ~/.subhub/jobs/<id>/
-//   subhub status [--json] [--refresh] subs, agents and found accounts (--json for scripts)
-//   subhub install [--no-rules]        put subhub on PATH and connect every installed agent
+//   subhub status [--json] [--refresh] subs and their health, agents, found accounts, engine version drift
+//   subhub install [--no-rules] [--no-check]   put subhub on PATH, connect every installed agent, check the subs
 //   subhub connect|disconnect <agent|all> [--no-rules]   claude, codex, gemini (Antigravity), cursor
 //                                      (connect adds an always-on rule to the agent's global rules file; SUBHUB_NO_RULES=1 skips it)
 //   subhub signin <sub> | signin claude --new [--email you@x.com] [--sso]   sign an account in (interactive)
@@ -18,7 +23,8 @@
 //   subhub ollama [--model M] [task]   a local Ollama model as an agent that can use your other subs
 //
 // ask exit codes: 0 answer · 2 bad sub, model, folder or job · 3 loop guard · 4 empty answer · 6 that sub is you
-// 7 not signed in / app not running · 8 turned off · 10 signed in as another account · 11 can't continue that job
+// 7 not signed in / app not running · 8 turned off · 9 known to be at its usage limit or out of credits (--force tries anyway)
+// 10 signed in as another account · 11 can't continue that job
 // 12 stalled (no activity for SUBHUB_IDLE seconds) · 13 stopped · 14 still running (job wait/result) · 124 timeout · 127 CLI missing
 import fs from "node:fs";
 import os from "node:os";
@@ -27,7 +33,7 @@ import crypto from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-const VERSION = "0.5.0-alpha";
+const VERSION = "0.6.0-alpha";
 const WIN = process.platform === "win32", MAC = process.platform === "darwin";
 const HOME = os.homedir();
 const SH = path.join(HOME, ".subhub"), REG = path.join(SH, "registry.json"), CFG = path.join(SH, "config.json");
@@ -40,7 +46,7 @@ for (const d of [SH, CACHE, JOBS]) fs.mkdirSync(d, { recursive: true, mode: 0o70
 // ---------------------------------------------------------------- helpers
 const die = (code, msg) => { process.stderr.write(`SubHub: ${msg}\n`); process.exit(code); };
 const readJSON = (f) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return null; } };
-const writeJSON = (f, o) => { fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f + ".t", JSON.stringify(o, null, 2) + "\n"); fs.renameSync(f + ".t", f); };
+const writeJSON = (f, o) => { fs.mkdirSync(path.dirname(f), { recursive: true }); const t = `${f}.${process.pid}.t`; fs.writeFileSync(t, JSON.stringify(o, null, 2) + "\n"); fs.renameSync(t, f); };
 const isDir = (p) => { try { return fs.statSync(p).isDirectory(); } catch { return false; } };
 const isFile = (p) => { try { return fs.statSync(p).isFile(); } catch { return false; } };
 const real = (p) => { try { return fs.realpathSync(p); } catch { return path.resolve(p); } };
@@ -172,6 +178,7 @@ const codexDirs = () => ["", ...new Set(profileDirs("CODEX_HOME").map(real).filt
 
 // ---------------------------------------------------------------- registry: each sub, its pin (email|org) and state
 // state: ok | signedout | changed:<email> | stopped (Ollama not running)
+// health (signed in is not the same as working): { state: working|limit|nocredits|noauth|failing, reason, checked, resets, via }
 function loadReg() {
   const r = readJSON(REG); if (r?.subs) return r;
   const tsv = path.join(SH, "registry.tsv"), subs = [];   // from the shell version
@@ -196,7 +203,7 @@ async function refresh() {
     if (old) {
       if (!w) old.state = "signedout";
       else if (`${w.email}|${w.org}` !== `${old.email}|${old.org}`) old.state = `changed:${w.email}`;
-      else Object.assign(old, { label: w.label, state: "ok" });
+      else { if (old.state !== "ok" && old.health?.state === "noauth") delete old.health; Object.assign(old, { label: w.label, state: "ok" }); }   // signed in again: try it again
     } else if (w && !reg.subs.some((s) => s.provider === p && `${s.email}|${s.org}` === `${w.email}|${w.org}`)) {
       reg.subs.push({ name: nextName(reg, p), provider: p, dir, email: w.email, org: w.org, label: w.label, state: "ok" });
     }
@@ -216,6 +223,10 @@ async function refresh() {
       Object.assign(o, { email: where, label: "Ollama", state: "ok" });
     } else if (o) o.state = "stopped";
   }
+  for (const s of loadReg().subs) {   // health an ask recorded while this ran (the CLI checks above take seconds) wins
+    const o = reg.subs.find((x) => x.name === s.name);
+    if (o && s.health && (!o.health || s.health.checked > o.health.checked)) o.health = s.health;
+  }
   sortSubs(reg); reg.refreshed = Date.now(); saveReg(reg);
   return reg;
 }
@@ -229,6 +240,244 @@ const cfg = () => readJSON(CFG) || { subs: {}, order: [] };
 function pref(name, key) { const v = cfg().subs?.[name]?.[key]; return key === "model" && v === "default" ? "" : (v ?? ""); }
 const isOn = (name) => cfg().subs?.[name]?.on !== false;
 const ranked = (reg) => [...new Set([...(cfg().order || []), ...reg.subs.map((s) => s.name)])].map((n) => reg.subs.find((s) => s.name === n)).filter(Boolean);
+
+// ---------------------------------------------------------------- health: which signed-in subs can actually do work
+// Learned from every real ask (free), and refreshed only by `subhub check`, `subhub list --refresh` and `subhub install`,
+// which run free CLI checks first and one tiny test prompt only where those can't prove the sub works.
+const HEALTH_WORDS = { working: "working", limit: "at its usage limit", nocredits: "out of credits or no plan", noauth: "not authorised for headless runs", failing: "failing", unknown: "unknown" };
+const RETRY = { limit: 3600000, failing: 1800000 };   // a limit with no reset time, or an unrecognised failure, counts as unknown again after this
+/** A sub's health now: a limit (or used-up credits) whose reset time has passed, or an old failure, is unknown again, so it gets tried. */
+function healthOf(s, now = Date.now()) {
+  const h = s?.health; if (!h || !HEALTH_WORDS[h.state] || h.state === "unknown") return { state: "unknown", reason: "", checked: h?.checked || 0, resets: null };
+  const until = h.state === "limit" ? h.resets || h.checked + RETRY.limit : h.state === "failing" ? h.checked + RETRY.failing : h.state === "nocredits" ? h.resets || 0 : 0;
+  if (until && until <= now) return { ...h, state: "unknown", was: h.state, resets: null, reason: h.state === "failing" ? `failed at ${when(h.checked)}; not tried since` : `its limit reset at ${when(until)}; not tried since` };
+  return h;
+}
+const usable = (h) => h.state === "working" || h.state === "unknown";
+/** Known not to work right now, so `subhub ask` fails fast (exit 9) instead of starting the CLI. */
+const blocked = (h, now = Date.now()) => h.state === "nocredits" || (h.state === "limit" && !!h.resets && h.resets > now);
+const when = (ms) => { const d = new Date(ms), hm = d.toTimeString().slice(0, 5); return d.toDateString() === new Date().toDateString() ? hm : `${d.toLocaleDateString("en-US", { month: "short", day: "numeric" })} ${hm}`; };
+const healthLine = (h) => `${HEALTH_WORDS[h.state]}${h.resets && h.state !== "unknown" ? ` until ${when(h.resets)}` : ""}${h.reason ? `: ${clip(h.reason, 110)}` : ""}`;
+const mkHealth = (h, via) => ({ state: h.state, reason: clip(h.reason || "", 200), checked: Date.now(), resets: h.resets || null, via });
+function setHealth(name, h, via) {
+  if (h.state === "unknown") return;
+  const reg = loadReg(), s = reg.subs.find((x) => x.name === name); if (!s) return;
+  s.health = mkHealth(h, via); saveReg(reg);
+}
+
+// Each CLI's own wording for "can't work right now", as [state, pattern]; the first match wins, provider rows before the common ones.
+// Sources: vendor docs and issue trackers (README, "Which subs actually work"). Loose and case-insensitive on purpose; add rows here.
+const HEALTH_PATTERNS = {
+  claude: [["limit", /usage limit reached|hit your (\w+ )?limit|(session|weekly|5-hour|opus|sonnet) limit reached|out of extra usage|limit will reset|rate_limit_error/i],
+    ["nocredits", /credit balance is too low|extra usage (is )?(disabled|not enabled|off)|no active subscription|subscription (has )?(expired|ended|lapsed|been cancell?ed|inactive)/i],
+    ["noauth", /not logged in|please run \/login|invalid api key|oauth token (has )?(expired|been revoked|revoked)|authentication_error|invalid bearer token/i]],
+  codex: [["limit", /hit your usage limit|usage ?limit ?(reached|exceeded)|usageLimitExceeded|exceeded the rate limit|rate limit reached/i],
+    ["nocredits", /insufficient_quota|exceeded your current quota|check your plan and billing|upgrade to \w+ to continue|no credits (left|remaining)/i],
+    ["noauth", /not logged in|codex login|token could not be refreshed|refresh token|401 unauthorized|unauthorized|sign in again/i]],
+  cursor: [["noauth", /authentication required|stored authentication is invalid|authentication error|not (logged|signed) in|(agent|cursor-agent) login|please log ?in/i],
+    ["limit", /hit your usage limit|usage limit|usage_limit_exceeded|rate limit/i],
+    ["nocredits", /out of (credits|usage|requests)|on-demand usage (is )?(required|disabled|off)|upgrade to (pro|ultra|business)|subscription (has )?(expired|ended|inactive)/i]],
+  gemini: [["failing", /model_capacity_exhausted|no capacity available|high demand/i],
+    ["limit", /exhausted your capacity|quota will reset|individual quota reached|quota (exceeded|exhausted)|resource_exhausted|rate limit|\b429\b/i],
+    ["noauth", /unauthenticated|not (signed|logged) in|sign in (again|to continue)|login required|permission_denied/i],
+    ["nocredits", /no (active )?(subscription|plan)|subscription (has )?(expired|ended)|requires a (paid )?(plan|subscription)/i]],
+  ollama: [["nocredits", /requires a subscription|upgrade (your plan|to)|\b403\b|insufficient balance/i],
+    ["limit", /usage limit|rate limit|\b429\b|too many requests/i],
+    ["noauth", /\b401\b|unauthori[sz]ed|ollama signin/i]],
+  common: [["nocredits", /payment required|\b402\b|insufficient (credits|funds|balance)|out of credits|billing/i],
+    ["limit", /usage limit|rate[ _-]?limit|too many requests|quota/i],
+    ["noauth", /unauthori[sz]ed|authentication (required|failed)|not (logged|signed) in|log ?in again/i]],
+};
+// An answer (exit 0) that is only one of these is a limit message, not an answer (some CLIs print it as the reply).
+const LIMIT_REPLY = /usage limit reached|hit your (\w+ )?(usage )?limit|out of extra usage|exhausted your capacity|quota will reset/i;
+const MON = "jan feb mar apr may jun jul aug sep oct nov dec".split(" ");
+/** Minutes a time zone is ahead of UTC at a moment, or null for an unknown zone. */
+function tzOffset(tz, at) {
+  try {
+    const p = Object.fromEntries(new Intl.DateTimeFormat("en-US", { timeZone: tz, hourCycle: "h23", year: "numeric", month: "numeric", day: "numeric", hour: "numeric", minute: "numeric", second: "numeric" }).formatToParts(at).filter((x) => x.type !== "literal").map((x) => [x.type, +x.value]));
+    return Math.round((Date.UTC(p.year, p.month - 1, p.day, p.hour % 24, p.minute, p.second) - Math.floor(at / 1000) * 1000) / 60000);
+  } catch { return null; }
+}
+/** The reset time a limit message names: an epoch ("limit reached|1717300000"), an ISO time, "in 2 hours 5 minutes" / "after 2h30m",
+ * or a wall-clock time ("resets 9:40pm (Europe/London)", "try again at Apr 30th, 2026 11:21 AM"). null if none. */
+function parseReset(text, now = Date.now()) {
+  const t = String(text || "");
+  let m = t.match(/limit reached\|(\d{10,13})/i) || t.match(/"?resets?_?at"?\s*[:=]\s*"?(\d{10,13})\b/i);
+  if (m) return +m[1] < 1e12 ? +m[1] * 1000 : +m[1];
+  m = t.match(/(?:resets?|retry|try again|until)\D{0,20}(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2}))/i);
+  if (m && Date.parse(m[1]) > now) return Date.parse(m[1]);
+  m = t.match(/(?:try again|resets?|retry|available again)\s+(?:in|after)\s+((?:\d+(?:\.\d+)?\s*(?:days?|hours?|hrs?|minutes?|mins?|seconds?|secs?|[dhms])(?![a-z])[\s,]*(?:and\s+)?)+)/i);
+  if (m) { let ms = 0; for (const [, n, u] of m[1].matchAll(/(\d+(?:\.\d+)?)\s*([dhms])/gi)) ms += +n * { d: 86400, h: 3600, m: 60, s: 1 }[u.toLowerCase()] * 1000; if (ms) return now + Math.round(ms); }
+  m = t.match(/(?:resets?(?:\s+at)?|try again at|until|available again at)\s+(?:on\s+)?(?:([A-Za-z]{3})[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s*(?:(\d{4}),?\s*)?(?:at\s+)?)?(\d{1,2})(?::(\d{2}))?\s*([ap]\.?m\.?)?\s*(?:\(([^)]+)\)|\b(UTC|GMT)\b)?/i);
+  if (m && (m[5] || m[6])) {
+    const pm = /^p/i.test(m[6] || ""), h = m[6] ? (+m[4] % 12) + (pm ? 12 : 0) : +m[4], mi = +(m[5] || 0);
+    if (h > 23 || mi > 59 || (m[1] && MON.indexOf(m[1].toLowerCase()) < 0)) return null;
+    const tz = m[7] || m[8], off = (tz && tzOffset(tz.trim(), now)) ?? -new Date(now).getTimezoneOffset();
+    const wall = new Date(now + off * 60000);   // now on that zone's clock, read with getUTC*
+    const y = m[3] ? +m[3] : wall.getUTCFullYear(), mo = m[1] ? MON.indexOf(m[1].toLowerCase()) : wall.getUTCMonth(), d = m[2] ? +m[2] : wall.getUTCDate();
+    let at = Date.UTC(y, mo, d, h, mi) - off * 60000;
+    if (!m[1] && at <= now) at += 86400000;
+    else if (m[1] && !m[3] && at < now - 86400000) at = Date.UTC(y + 1, mo, d, h, mi) - off * 60000;
+    return at;
+  }
+  return null;
+}
+const lineAt = (s, i) => clip(s.slice(s.lastIndexOf("\n", i) + 1, (s.indexOf("\n", i) + 1 || s.length + 1) - 1).replace(/^\d\d:\d\d:\d\d /, "").replace(/^(error|tool error): /i, ""), 160);
+/** Health from one run's outcome: exit code, the answer, and the error text (stderr, error lines). probe: a test prompt that asked for PONG. */
+function classify(p, { code, answer = "", text = "" }, probe = false) {
+  const a = String(answer).trim(), rows = [...(HEALTH_PATTERNS[p] || []), ...HEALTH_PATTERNS.common];
+  const hit = (s) => { for (const [state, re] of rows) { const m = re.exec(s); if (m) return { state, line: lineAt(s, m.index) }; } return null; };
+  const as = (f, s) => ({ state: f.state, reason: f.line, resets: ["limit", "nocredits"].includes(f.state) ? parseReset(f.line) ?? parseReset(s) : null });
+  if (code === 0 && a) {
+    if (a.length < 300 && LIMIT_REPLY.test(a) && !(probe && /\bpong\b/i.test(a))) { const f = hit(a); if (f && f.state !== "failing") return as(f, a); }
+    return { state: "working", reason: probe ? (/\bpong\b/i.test(a) ? "answered a test prompt" : `answered a test prompt (unexpected reply: ${clip(a, 60)})`) : "answered a task" };
+  }
+  const all = `${a}\n${text}`, f = hit(all);
+  if (f) return as(f, all);
+  if (code === 124) return { state: "failing", reason: "no answer before the time limit" };
+  const last = String(text).split("\n").map((l) => l.replace(/^\d\d:\d\d:\d\d /, "").trim()).filter(Boolean).pop() || a.split("\n").pop();
+  return { state: "failing", reason: clip(last || (code === 4 ? "empty answer" : `exit ${code}`), 160) };
+}
+/** What a finished job said, for classify(). */
+function outcome(j) {
+  const err = jtext(j.id, "stderr.log").trim().slice(-3000);
+  const prog = jtext(j.id, "progress.log").split("\n").filter((l) => /error|retry|limit|quota|couldn't start/i.test(l)).slice(-5).join("\n");
+  return { code: j.code, answer: jtext(j.id, "answer.txt"), text: `${prog}\n${err}` };
+}
+/** Passive learning after every real ask: a normal answer marks the sub working, a limit/credits/auth failure marks it so. */
+function learn(j) {
+  if (!j || j.probe || [12, 13, 124].includes(j.code)) return;   // stalled, stopped, out of time: says nothing about the account
+  try { setHealth(j.sub, classify(j.provider, outcome(j)), "ask"); } catch {}
+}
+
+// ---------------------------------------------------------------- check: free CLI checks first, a tiny test prompt only where needed
+const PROBE = "Reply with exactly one word: PONG. Don't use any tools.", PROBE_SECS = 75;
+/** Codex: `codex login status`, then `codex app-server` (stdio JSON-RPC) account/read and account/rateLimits/read. No prompt, no usage. */
+function codexLimits(bin, dir) {
+  return new Promise((resolve) => {
+    const p = prep(bin, ["app-server"]), got = {}; let buf = "", done = false, c;
+    const end = (v) => { if (done) return; done = true; clearTimeout(t); if (c?.pid) killTree(c.pid); resolve(v); };
+    const t = setTimeout(() => end(sum()), 20000);
+    const send = (o) => { try { c.stdin.write(JSON.stringify(o) + "\n"); } catch {} };
+    const sum = () => {
+      const a = got[1]?.result, rl = got[2]?.result;
+      if (a && !a.account && a.requiresOpenaiAuth) return { state: "noauth", reason: "codex app-server: no account signed in" };
+      if (!rl) return null;
+      const buckets = Object.values(rl.rateLimitsByLimitId || {}).concat(rl.rateLimitsByLimitId ? [] : [rl.rateLimits]).filter((b) => b && typeof b === "object");
+      const win = (w) => !w.windowDurationMins ? "window" : w.windowDurationMins >= 10080 ? "weekly" : w.windowDurationMins % 60 ? `${w.windowDurationMins}-minute` : `${w.windowDurationMins / 60}h`;
+      let hit = null; const used = [];
+      for (const b of buckets) {
+        const ws = ["primary", "secondary"].map((k) => [k, b[k]]).filter(([, w]) => w && typeof w.usedPercent === "number");
+        if ((b.limitId || "codex") === "codex" || b === buckets[0]) for (const [, w] of ws) used.push(`${win(w)} ${Math.round(w.usedPercent)}% used`);
+        let full = ws.filter(([, w]) => w.usedPercent >= 100);   // the windows used up; if only the server's flag says so, the one it names (else primary)
+        if (!full.length && b.rateLimitReachedType) full = ws.filter(([k]) => k === b.rateLimitReachedType).concat(ws.filter(([k]) => k === "primary")).slice(0, 1);
+        for (const [, w] of full) { const r = w.resetsAt ? w.resetsAt * 1000 : null; if (!hit || (r || 0) > (hit.resets || 0)) hit = { state: "limit", reason: `codex rate limits: ${win(w)} limit${b.limitId && b.limitId !== "codex" ? ` (${b.limitId})` : ""} used up${b.rateLimitReachedType ? ` (${b.rateLimitReachedType})` : ""}`, resets: r }; }
+      }
+      if (hit) return hit;
+      if (!used.length) return null;
+      return { state: "working", reason: `codex rate limits OK (${[...new Set(used)].join(", ")}${a?.account?.planType ? `; plan ${a.account.planType}` : ""}), no prompt sent` };
+    };
+    try { c = spawn(p.cmd, p.args, { ...p.opts, env: envFor("codex", dir), stdio: ["pipe", "pipe", "ignore"], windowsHide: true, detached: !WIN }); } catch { return end(null); }
+    c.on("error", () => end(null)); c.on("close", () => end(sum())); c.stdin.on("error", () => {});
+    c.stdout.setEncoding("utf8");
+    c.stdout.on("data", (d) => {
+      buf += d; let i;
+      while ((i = buf.indexOf("\n")) >= 0) {
+        const l = buf.slice(0, i); buf = buf.slice(i + 1); let m; try { m = JSON.parse(l); } catch { continue; }
+        if (m?.id === 0) { send({ method: "initialized", params: {} }); send({ method: "account/read", id: 1, params: { refreshToken: false } }); send({ method: "account/rateLimits/read", id: 2 }); }
+        else if (m?.id === 1 || m?.id === 2) { got[m.id] = m; if (got[1] && got[2]) end(sum()); }
+      }
+    });
+    send({ method: "initialize", id: 0, params: { clientInfo: { name: "subhub", title: "SubHub", version: VERSION } } });
+  });
+}
+/** Ollama Cloud: GET https://ollama.com/api/balance with OLLAMA_API_KEY (docs.ollama.com/api/balance). */
+async function ollamaBalance() {
+  try {
+    const r = await fetch("https://ollama.com/api/balance", { headers: { Authorization: "Bearer " + process.env.OLLAMA_API_KEY }, signal: AbortSignal.timeout(15000) });
+    if (r.status === 401) return { state: "noauth", reason: "ollama.com refused OLLAMA_API_KEY (401)" };
+    if (r.status === 403) return { state: "nocredits", reason: "ollama.com: account suspended (403)" };
+    if (!r.ok) return null;
+    const d = await r.json(), inc = d?.included || {};
+    for (const k of ["session", "weekly"]) if (inc[k] && inc[k].remaining_percent <= 0) return { state: "limit", reason: `Ollama cloud ${k} limit used up`, resets: Date.parse(inc[k].resets_at) || null };
+    if (typeof inc.balance_usd === "number" && inc.balance_usd <= 0 && !(d.purchased?.balance_usd > 0)) return { state: "nocredits", reason: "Ollama cloud credits used up", resets: Date.parse(inc.period?.until) || null };
+    return { state: "working", reason: "ollama.com balance OK, no prompt sent" };
+  } catch { return null; }
+}
+/** Layer 1: what the CLI itself can prove for free (refresh() has already run `claude auth status`, `cursor-agent status`
+ * and `--list-models`, `agy models`, and Ollama's /api/tags). null: it can't prove the sub works, so a test prompt is needed. */
+async function freeCheck(s) {
+  if (s.provider === "ollama") {
+    const ms = readJSON(path.join(CACHE, "ollama-models.json")) || [], tasks = ms.filter((m) => m.caps.includes("completion") || !m.caps.includes("embedding"));
+    if (tasks.some((m) => !m.cloud)) return { state: "working", reason: `Ollama is running with ${tasks.filter((m) => !m.cloud).length} local model(s); no prompt sent` };
+    if (!tasks.length) return { state: "failing", reason: "Ollama has no model that can do tasks; pull one yourself (SubHub never downloads models)" };
+    return process.env.OLLAMA_API_KEY ? ollamaBalance() : null;   // cloud models only
+  }
+  const bin = binFor(s.provider); if (!bin) return { state: "failing", reason: `${BINARY[s.provider]} isn't installed` };
+  if (s.provider === "codex") {
+    const r = run(bin, ["login", "status"], { env: envFor("codex", s.dir), timeout: 30000 });
+    if (r.code !== 0) return { state: "noauth", reason: `codex login status: ${clip((r.out + r.err).trim().split("\n").pop() || "not logged in", 100)}` };
+    return codexLimits(bin, s.dir);
+  }
+  return null;
+}
+/** The cheapest, fastest model a sub offers, for the test prompt. */
+function probeModel(s) {
+  const cache = (f) => { try { return fs.readFileSync(path.join(CACHE, f), "utf8"); } catch { return ""; } };
+  if (s.provider === "claude") return "haiku";
+  if (s.provider === "cursor") return "auto";
+  if (s.provider === "gemini") { const ids = cache("gemini-models.txt").split("\n").map((l) => l.split("\t")[0]).filter(Boolean); return ids.find((i) => /flash.*lite/.test(i)) || ids.find((i) => /flash.*low/.test(i)) || ids.find((i) => /flash/.test(i)) || "default"; }
+  if (s.provider === "codex") { let j; try { j = JSON.parse(run(binFor("codex"), ["debug", "models"], { env: envFor("codex", s.dir) }).out); } catch {} return (j?.models || []).filter((m) => m.visibility === "list").map((m) => m.slug).find((x) => /mini|nano|spark/.test(x)) || "default"; }
+  const ms = readJSON(path.join(CACHE, "ollama-models.json")) || []; return (ms.find((m) => !m.caps.includes("embedding") || m.caps.includes("completion")))?.name || "default";
+}
+/** Layer 2: one headless test prompt through the normal ask path (same account, env, pins and flags), in an empty temp folder. */
+function probe(s) {
+  return new Promise((resolve) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "subhub-probe-")), model = probeModel(s);
+    const c = spawn(process.execPath, [SELF, "ask", "--force", "--in", dir, s.name, model, PROBE], { cwd: dir, env: { ...process.env, SUBHUB_PROBE: "1", SUBHUB_TIMEOUT: String(PROBE_SECS) }, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    let out = "", err = ""; c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", (d) => (err += d));
+    c.on("close", (code) => {
+      const id = err.match(/job ([0-9a-f]{6})/)?.[1], j = id ? jget(id) : null, last = clip(err.trim().split("\n").pop()?.replace(/^SubHub: /, "") || `exit ${code}`, 160);
+      let h;
+      if (!j) h = code === 3 ? { state: "unknown", reason: "can't test from inside a sub" } : [7, 10].includes(code) ? { state: "noauth", reason: last } : { state: "failing", reason: last };   // refused before it ran
+      else h = classify(s.provider, { ...outcome(j), answer: out.trim() || jtext(id, "answer.txt") }, true);
+      if (id) fs.rmSync(path.join(JOBS, id), { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true });
+      resolve({ ...h, model });
+    });
+  });
+}
+/** Checks every sub (or the named ones) in parallel, stores the health, returns one row per sub. */
+async function checkSubs(names = []) {
+  const reg = await refresh();
+  for (const n of names) if (!reg.subs.some((s) => s.name === n)) die(2, `unknown sub '${n}'. subhub list shows them.`);
+  const rows = await Promise.all((names.length ? reg.subs.filter((s) => names.includes(s.name)) : reg.subs).map(async (s) => {
+    const row = { name: s.name, provider: s.provider, account: s.email, result: "", reason: "", resets: null, how: "not checked" };
+    const skip = (result, reason) => Object.assign(row, { result, reason });
+    if (!names.includes(s.name) && !isOn(s.name)) return skip("off", "turned off by the user");
+    if (s.state === "signedout") return skip("signedout", `signed out (subhub signin ${s.name})`);
+    if (s.state.startsWith("changed:")) return skip("changed", `signed in as ${s.state.slice(8)}, not ${s.email} (subhub signin ${s.name})`);
+    if (s.state === "stopped") return skip("stopped", "Ollama isn't running (SubHub never starts it)");
+    const me = isCaller(s); if (me) return skip("you", `this is you (${me}), not checked`);
+    let h = await freeCheck(s), how = "free check";
+    if (!h) { h = await probe(s); how = `test prompt, model ${h.model}`; }
+    return Object.assign(row, { result: h.state, reason: h.reason, resets: h.resets || null, how, health: h.state === "unknown" ? null : h });
+  }));
+  const r2 = loadReg();
+  for (const row of rows) { const s = r2.subs.find((x) => x.name === row.name); if (s && row.health) s.health = mkHealth(row.health, "check"); delete row.health; }
+  saveReg(r2);
+  return rows;
+}
+function printChecks(rows) {
+  const word = (r) => HEALTH_WORDS[r.result] || { off: "off", signedout: "signed out", changed: "signed in as someone else", stopped: "not running", you: "this is you" }[r.result] || r.result;
+  console.log(`${"Sub".padEnd(10)} ${"Account".padEnd(26)} ${"Result".padEnd(32)} ${"Resets".padEnd(13)} Reason`);
+  for (const r of rows) console.log(`${r.name.padEnd(10)} ${clip(r.account, 26).padEnd(26)} ${word(r).padEnd(32)} ${(r.resets ? when(r.resets) : "").padEnd(13)} ${r.reason}${r.how !== "not checked" ? ` [${r.how}]` : ""}`);
+}
+async function cmdCheck(args) {
+  const rows = await checkSubs(args.filter((a) => !a.startsWith("--")));
+  if (args.includes("--json")) { console.log(JSON.stringify({ version: VERSION, checked: Date.now(), subs: rows })); return; }
+  printChecks(rows);
+}
 
 // ---------------------------------------------------------------- models
 const CLAUDE_MODELS = [
@@ -267,17 +516,22 @@ function models(s, short) {
 
 // ---------------------------------------------------------------- list / models / status
 async function cmdList(force) {
-  const reg = await fresh(force); const out = [];
+  if (force) await checkSubs();   // --refresh: also re-tests every sub (free checks, then a tiny test prompt where needed)
+  const reg = await fresh(false); const out = [], now = Date.now();
   out.push("# Your subs (from SubHub)", "", "Run one with `subhub ask <sub> <model|default>` and the brief (see the subhub skill). Never pick the account you are running as.", "",
     "| Sub | Account | Use it for | Can do, and limits |", "|---|---|---|---|");
-  const ready = [], off = [], waiting = [];
+  const ready = [], off = [], waiting = [], stale = [];
   for (const s of ranked(reg)) {
     if (!isOn(s.name)) { off.push(s.name); continue; }
     if (s.state === "signedout") { waiting.push(`${s.name} (signed out)`); continue; }
     if (s.state.startsWith("changed:")) { waiting.push(`${s.name} (signed in as ${s.state.slice(8)}, not ${s.email})`); continue; }
     if (s.state === "stopped") { waiting.push(`${s.name} (Ollama isn't running)`); continue; }
+    const h = healthOf(s, now), age = h.checked ? now - h.checked : 0;
+    if (!usable(h)) { waiting.push(`${s.name} (${healthLine(h)}${age > 3600000 ? `; seen ${ago(age)} ago` : ""})`); continue; }
+    if (h.state === "working" && age > 3 * 86400000) stale.push(`${s.name} ${ago(age)} ago`);
     out.push(`| ${s.name} | ${s.email}, ${s.label} | ${pref(s.name, "use_for") || USE_FOR[s.provider]} | ${LIMITS[s.provider]} |`); ready.push(s);
   }
+  if (stale.length) out.push("", `Last seen working: ${stale.join(", ")}.`);
   out.push("", "All subs start fresh (no memory of your conversation), run headless (they can't ask questions), with full access and no approval prompts, in the folder you call from (or `--in <folder>`), for up to 30 minutes (stopped early as stalled after 15 minutes with no activity).",
     "", "Every ask is a job: `subhub ask --bg …` returns a job id at once; `subhub job wait <id>` collects it, `subhub job <id>` shows its progress, and `subhub ask --continue <id> <follow-up>` continues the same conversation (also after a timeout or stall).",
     "", "## Models", "", "Pass an id as the 2nd argument, or default. Quote ids with brackets.");
@@ -289,7 +543,7 @@ async function cmdList(force) {
   }
   if (firstClaude) out.push("", `**Every Claude sub** (${ready.filter((s) => s.provider === "claude").map((s) => s.name).join(", ")})`, ...models(firstClaude, true));
   if (off.length) out.push("", `Turned off by the user, don't use: ${off.join(", ")}`);
-  if (waiting.length) out.push("", `Not ready: ${waiting.join(", ")}. The user fixes these with \`subhub status\`.`);
+  if (waiting.length) out.push("", `Not ready, don't use: ${waiting.join(", ")}. The user fixes sign-ins with \`subhub status\` and re-tests subs with \`subhub check\`.`);
   console.log(out.join("\n"));
 }
 async function cmdModels(name) {
@@ -319,12 +573,18 @@ function found(reg) {
 async function cmdStatus(args) {
   const reg = await fresh(args.includes("--refresh"));
   const agents = AGENTS.map((a) => ({ id: a, name: AGENT_NAME[a], installed: !!binFor(a), connected: agentOn(a), rules: !!rulesIn(a), rulesFile: rulesIn(a) || RULE_FILES[a]()[0] || null }));
-  const f = found(reg), h = hookCfg(), hook = { on: h.on, types: h.types, loaded: claudePlugin() };
+  const f = found(reg), h = hookCfg(), hook = { on: h.on, types: h.types, loaded: claudePlugin() }, eng = engines();
   if (args.includes("--json")) {
-    console.log(JSON.stringify({ version: VERSION, subs: reg.subs.map((s) => ({ name: s.name, provider: s.provider, folder: s.dir, email: s.email, label: s.label, state: s.state, on: isOn(s.name) })), agents, hook, found: f }));
+    console.log(JSON.stringify({ version: VERSION, engine: eng, subs: reg.subs.map((s) => { const hh = healthOf(s); return { name: s.name, provider: s.provider, folder: s.dir, email: s.email, label: s.label, state: s.state, on: isOn(s.name),
+      health: { state: hh.state, reason: hh.reason || "", checked: hh.checked || null, resets: hh.resets || null, via: s.health?.via || null, usable: usable(hh) } }; }), agents, hook, found: f }));
     return;
   }
-  console.log("Subs:"); for (const s of reg.subs) console.log(`  ${s.name.padEnd(10)} ${s.email.padEnd(28)} ${s.label.padEnd(26)} ${isOn(s.name) ? s.state : "off"}`);
+  for (const w of eng.drift) console.log(`Warning: ${w}`);
+  console.log("Subs:");
+  for (const s of reg.subs) {
+    const hh = healthOf(s), seen = hh.checked ? ` (seen ${ago(Date.now() - hh.checked)} ago)` : "";
+    console.log(`  ${s.name.padEnd(10)} ${s.email.padEnd(28)} ${s.label.padEnd(26)} ${isOn(s.name) ? s.state : "off"}${s.state === "ok" ? `, ${hh.state === "unknown" && !hh.reason ? "not checked yet" : healthLine(hh) + seen}` : ""}`);
+  }
   console.log("Agents:"); for (const a of agents) console.log(`  ${a.name.padEnd(12)} ${!a.installed ? "not installed" : a.connected ? "connected" : `not connected (subhub connect ${a.id})`}${a.rules ? `, always-on rule in ${a.rulesFile}` : ""}`);
   console.log(`Claude Code redirect hook: ${hook.on ? "on" : "off"} (${hook.types.map((t) => t || "no type").join(", ") || "no types"} → ${RELAY}; "hook": false in ${CFG} or SUBHUB_HOOK=0 turns it off)${hook.loaded ? "" : ". The relay agent and the hook load only with the plugin installed through Claude Code's plugin manager, which it isn't"}`);
   if (f.length) { console.log("Found, not signed in (subhub signin claude --new --email <email>):"); for (const x of f) console.log(`  ${x.email} · ${["team", "enterprise"].includes(x.type) ? "Team " + x.orgName : "Personal"}`); }
@@ -358,6 +618,7 @@ async function cmdAsk(argv) {
   const args = [...argv], opt = {};
   for (const f of ["--in", "--brief-file", "--continue", "--model"]) { const i = args.indexOf(f); if (i >= 0) { opt[f] = args[i + 1]; args.splice(i, 2); } }
   const bg = args.indexOf("--bg"); if (bg >= 0) args.splice(bg, 1);
+  const fi = args.indexOf("--force"), force = fi >= 0; if (force) args.splice(fi, 1);
   let parent = null, name, model, task;
   if (opt["--continue"]) {
     parent = jload(opt["--continue"]) || die(2, `no job '${opt["--continue"]}'. subhub jobs lists them.`);
@@ -370,8 +631,8 @@ async function cmdAsk(argv) {
   }
   if (!task) task = opt["--brief-file"] ? fs.readFileSync(expand(opt["--brief-file"]), "utf8") : readStdin();
   // Who is calling: a Claude Code session says so in its environment (isCaller). Any agent may call.
-  const env = { ...process.env };
-  for (const v of CALLER_VARS) delete env[v];          // a sub uses its own sign-in, never the caller's
+  const env = { ...process.env }, isProbe = !!env.SUBHUB_PROBE;
+  for (const v of [...CALLER_VARS, "SUBHUB_PROBE"]) delete env[v];          // a sub uses its own sign-in, never the caller's
   const max = +env.SUBHUB_MAX_DEPTH || 1, depth = +env.SUBHUB_DEPTH || 0;
   if (depth >= max) die(3, `loop guard: depth ${max} reached`);
   env.SUBHUB_DEPTH = String(depth + 1);
@@ -382,9 +643,12 @@ async function cmdAsk(argv) {
   if (s.state === "signedout") die(7, `${name} is signed out. Sign it in with: subhub signin ${name}`);
   if (s.state.startsWith("changed:")) die(10, `${name} isn't signed in as ${s.email} any more (it's ${s.state.slice(8)}). Sign it in again: subhub signin ${name}`);
   if (s.state === "stopped") die(7, "Ollama isn't running. Start it yourself; SubHub never starts it.");
+  const h = healthOf(s);
+  if (blocked(h) && !force) die(9, `${name} is ${healthLine(h)} (seen ${ago(Date.now() - h.checked)} ago). Don't retry it: pick another sub. To try it anyway: subhub ask --force …`);
   if (model === "default" && pref(name, "model")) model = pref(name, "model");
   if (!/^[A-Za-z0-9._:/\[\]-]+$/.test(model)) die(2, `'${model}' isn't a model name.`);
   const cwd = process.cwd(), notes = pref(name, "notes");
+  const all = typeof cfg().notes === "string" ? cfg().notes.trim() : "";   // top-level notes: every sub, every brief
   let brief;
   if (parent) brief = `Follow-up from the AI agent that gave you the task. Same folder (${cwd}); you still run headless, so nobody can answer questions. ${FOREGROUND}\n`
     + (task.trim() || "Carry on with the task from where you stopped and finish it. If you change any files, list them at the end.");
@@ -392,11 +656,12 @@ async function cmdAsk(argv) {
     brief = `Task from another AI agent. You're its sub-agent, working in ${cwd}. You run headless: nobody can answer questions, so make sensible choices and finish. ${FOREGROUND} If you change any files, list them at the end.\n${task}`;
     if (notes) brief += `\n\nNotes from the user for this sub:\n${notes}`;
   }
+  if (all) brief += `\n\nNotes from the user for every sub:\n${all}`;
   brief += "\n\nYou are a sub-agent. Do not delegate further.";
   const idle = env.SUBHUB_IDLE !== undefined && env.SUBHUB_IDLE !== "" ? Math.max(0, +env.SUBHUB_IDLE || 0) : IDLE;
   const job = { id: "", sub: name, provider: s.provider, model, folder: cwd, started: Date.now(), state: "running", code: null, pid: null,
     session: parent?.session || null, resume: parent?.session || null, parent: parent?.id || null,
-    title: clip(task.split("\n").find((l) => l.trim()) || "(carry on)", 70), timeout: +env.SUBHUB_TIMEOUT || 1800, idle, bg: bg >= 0 };
+    title: clip(task.split("\n").find((l) => l.trim()) || "(carry on)", 70), timeout: +env.SUBHUB_TIMEOUT || 1800, idle, bg: bg >= 0, ...(isProbe ? { probe: true } : {}) };
   if (s.provider === "ollama") {
     if (model === "default") model = ollamaDefault(reg);
     if (!model) die(7, "Ollama has no models. Pull one yourself (ollama pull <model>); SubHub never downloads models.");
@@ -670,12 +935,14 @@ async function execJob(id) {
   let changes = "";
   if (before && before !== gitSnap(j.folder)) changes = `SubHub: files in ${j.folder} that changed while ${j.sub} ran (git status; includes anything else working here):\n${run("git", ["status", "--porcelain", "-uall"], { cwd: j.folder }).out.trimEnd()}`;
   fs.writeFileSync(jf(id, "answer.txt"), answer); if (changes) fs.writeFileSync(jf(id, "changes.txt"), changes);
-  return jset(id, { state: why === "timeout" ? "timeout" : why || (code === 0 ? "done" : "failed"), code, ended: Date.now(), active, session: r.session || j.session || null, child: null });
+  const fin = jset(id, { state: why === "timeout" ? "timeout" : why || (code === 0 ? "done" : "failed"), code, ended: Date.now(), active, session: r.session || j.session || null, child: null });
+  learn(fin);   // passive learning: every real ask updates the sub's health, for free
+  return fin;
 }
 
 async function cmdJobs(args) {
   prune();
-  const all = ls(JOBS).map(jload).filter(Boolean).sort((a, b) => b.started - a.started).filter((j, i) => j.state === "running" || i < 20), now = Date.now();
+  const all = ls(JOBS).map(jload).filter((j) => j && !j.probe).sort((a, b) => b.started - a.started).filter((j, i) => j.state === "running" || i < 20), now = Date.now();
   if (args.includes("--json")) { console.log(JSON.stringify(all.map((j) => ({ ...j, sinceActivity: now - (j.active || j.started), continuable: !whyNot(j) })))); return; }
   if (!all.length) { console.log("No jobs yet."); return; }
   for (const j of all) console.log(`${j.id}  ${j.state.padEnd(11)} ${j.sub.padEnd(10)} ${(ago(now - j.started) + " ago").padEnd(10)} ${j.state === "running" ? `active ${ago(now - (j.active || j.started))} ago  ` : ""}${j.title || ""}`);
@@ -970,7 +1237,7 @@ function migrate() {
   for (const d of ["models", "run"]) fs.rmSync(path.join(SH, d), { recursive: true, force: true });
   if (!WIN) { fs.writeFileSync(old, `#!/bin/sh\n# Old name for subhub, kept so older sessions keep working.\ncase $1 in --list) exec "${launcher()}" list ;; --models) exec "${launcher()}" models "$2" ;; esac\nexec "${launcher()}" ask "$@"\n`); fs.chmodSync(old, 0o755); }
 }
-async function cmdInstall(rules) {
+async function cmdInstall(rules, check = true) {
   fs.mkdirSync(BIN, { recursive: true });
   fs.copyFileSync(SELF, path.join(BIN, "subhub.mjs"));
   if (WIN) {
@@ -993,6 +1260,10 @@ async function cmdInstall(rules) {
   const reg = await refresh();
   for (const s of reg.subs) console.log(`  ${s.name.padEnd(10)} ${s.email} · ${s.label} (${s.state})`);
   console.log("Connecting agents…"); for (const a of AGENTS) connect(a, rules);
+  if (check) {
+    console.log("Checking which subs actually work: free CLI checks first, then one tiny test prompt (a one-word reply) per sub where those can't tell. This uses a little of those subs' usage; skip it with --no-check.");
+    printChecks(await checkSubs());
+  } else console.log("Skipped checking which subs work (--no-check). Run `subhub check` any time.");
   console.log("Done. Start a new session in any connected agent and ask it to use your subs.");
 }
 async function cmdSignin(args) {
@@ -1025,10 +1296,34 @@ function cmdOnOff(on, name) {
   console.log(`${name} is ${on ? "on" : "off"}.`);
 }
 
+// ---------------------------------------------------------------- engine copies: `subhub` on PATH (~/.subhub/bin) and the plugin copies agents load
+/** The VERSION in an engine file (read from its first 16 KB), or null. */
+function versionIn(file) {
+  try { const fd = fs.openSync(file, "r"), b = Buffer.alloc(16384), n = fs.readSync(fd, b, 0, b.length, 0); fs.closeSync(fd); return b.toString("utf8", 0, n).match(/^const VERSION = "([^"]+)"/m)?.[1] || null; } catch { return null; }
+}
+const vnum = (v) => String(v || "").split(/[^\d]+/).filter(Boolean).slice(0, 3).map(Number);
+const newer = (a, b) => { const x = vnum(a), y = vnum(b); for (let i = 0; i < 3; i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) > (y[i] || 0); return false; };
+/** This engine, the one on PATH, and Claude Code's plugin copies; drift: a warning per mismatch, naming the fix. */
+function engines() {
+  const inst = path.join(BIN, "subhub.mjs"), installed = versionIn(inst), copies = [{ where: SELF, version: VERSION }];
+  const ip = readJSON(path.join(HOME, ".claude", "plugins", "installed_plugins.json"))?.plugins?.["subhub@subhub"];
+  for (const e of Array.isArray(ip) ? ip : []) {
+    const f = e?.installPath ? path.join(e.installPath, "bin", "subhub.mjs") : null, v = (f && versionIn(f)) || e?.version;
+    if (v && f && real(f) !== real(SELF)) copies.push({ where: f, version: v, plugin: "Claude Code" });
+  }
+  const drift = [], best = copies.reduce((a, b) => (newer(b.version, a.version) ? b : a), copies[0]);
+  const fix = `run \`subhub install\` from the newest copy: node "${newer(best.version, installed) || !installed ? best.where : inst}" install`;
+  if (!installed) drift.push(`subhub isn't installed in ${BIN}, so agents can't run it (the Claude Code redirect hook stays off). Fix: ${fix}`);
+  else for (const c of copies) if (c.version !== installed && real(c.where) !== real(inst))
+    drift.push(`${c.plugin ? `Claude Code's SubHub plugin (${c.where})` : `This engine (${c.where})`} is ${c.version}, but \`subhub\` on PATH (${inst}) is ${installed}; the relay agent and the hook expect the same version (the hook stays off until they match). Fix: ${fix}`);
+  return { running: VERSION, path: SELF, installed, copies, drift };
+}
+
 // ---------------------------------------------------------------- Claude Code redirect hook (plugin hooks/hooks.json: PreToolUse on Agent|Task)
 // `subhub hook pretool` reads the hook JSON on stdin. When Claude is about to start a generic built-in sub-agent and a sub is
 // ready, it denies that call once with a pointer to the relay agent; the same call again (same session and prompt) goes ahead.
-// Anything else, or any error, prints nothing: the call goes ahead. Reads only registry.json and config.json: no spawns, no network.
+// Anything else, or any error, prints nothing: the call goes ahead. Reads only registry.json, config.json and the VERSION line of
+// ~/.subhub/bin/subhub.mjs (a sub counts only if its stored health is working or unknown): no spawns, no network.
 const RELAY = "subhub:relay", HOOK_TYPES = ["general-purpose", "Explore", "claude", ""], HOOK_STATE = path.join(SH, "hook-denied.json");
 /** Whether the redirect hook is on (config "hook": false or SUBHUB_HOOK=0 turn it off) and the agent types it redirects ("hook_types"; "" = no type). */
 function hookCfg(c = cfg()) {
@@ -1049,8 +1344,9 @@ function cmdHook(args) {
     if (ti.subagent_type != null && typeof ti.subagent_type !== "string") return;   // a shape this hook doesn't know
     const type = (ti.subagent_type || "").trim();
     if (type === RELAY || !h.types.some((t) => t.trim().toLowerCase() === type.toLowerCase())) return;
+    if (versionIn(path.join(BIN, "subhub.mjs")) !== VERSION) return;   // `subhub` on PATH is missing or another version: the relay couldn't work
     const subs = readJSON(REG)?.subs; if (!Array.isArray(subs)) return;
-    if (!subs.some((s) => s && c.subs?.[s.name]?.on !== false && s.state === "ok" && !isCaller(s, process.env, true))) return;
+    if (!subs.some((s) => s && c.subs?.[s.name]?.on !== false && s.state === "ok" && usable(healthOf(s)) && !isCaller(s, process.env, true))) return;
     const key = crypto.createHash("sha1").update(`${inp.session_id || ""}\0${typeof ti.prompt === "string" ? ti.prompt : JSON.stringify(ti.prompt ?? "")}`).digest("hex");
     const now = Date.now(), old = readJSON(HOOK_STATE), st = {};
     for (const [k, t] of Object.entries(old && typeof old === "object" ? old : {})) if (typeof t === "number" && now - t < 86400000) st[k] = t;   // a day
@@ -1075,13 +1371,14 @@ switch (cmd) {
   case "_run": { let j; try { j = await execJob(rest[0]); } catch (e) { j = jset(rest[0], { state: "failed", code: 1, ended: Date.now(), note: String(e.message || e) }); } process.exit(j.code ?? 1); }
   case "status": await cmdStatus(rest); break;
   case "refresh": await refresh(); console.log("Refreshed."); break;
-  case "install": await cmdInstall(withRules); break;
+  case "install": await cmdInstall(withRules, !flags.includes("--no-check") && !process.env.SUBHUB_NO_CHECK); break;
+  case "check": await cmdCheck(rest); break;
   case "connect": for (const a of target(words[0])) connect(a, withRules); break;
   case "disconnect": for (const a of target(words[0])) disconnect(a); break;
   case "signin": await cmdSignin(rest); break;
   case "remove": cmdRemove(rest[0]); break;
   case "on": case "off": cmdOnOff(cmd === "on", rest[0]); break;
-  case "config": console.log(`${CFG}:\n` + (pexist(CFG) ? fs.readFileSync(CFG, "utf8") : '(none yet: {"subs":{"<sub>":{"on":true,"use_for":"","model":"default","notes":""}},"order":[],"hook":true})')); break;
+  case "config": console.log(`${CFG}:\n` + (pexist(CFG) ? fs.readFileSync(CFG, "utf8") : '(none yet: {"subs":{"<sub>":{"on":true,"use_for":"","model":"default","notes":""}},"order":[],"notes":"","hook":true})')); break;
   case "ollama": await cmdOllama(rest); break;
   case "hook": cmdHook(rest); break;
   case "version": case "--version": console.log(`subhub ${VERSION}`); break;

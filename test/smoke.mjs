@@ -43,11 +43,28 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const HELP = { claude: "--output-format <format> text, json or stream-json\\n--resume [value]", codex: "Commands:\\n  resume\\n--json  Print events to stdout as JSONL",
   "cursor-agent": "--output-format <format> text | json | stream-json\\n--resume [chatId]", agy: "--conversation  Resume\\n--output-format (text, json, stream-json)\\n--settings" };
 if (a.includes("--help")) { if (!process.env.STANDIN_OLD) console.log(HELP[tool]); process.exit(0); }
+// health modes (working, limit, credits, noauth, garbage): <CLAUDE_CONFIG_DIR or ~/.claude>/standin-mode for claude, ~/.standin/<tool> for the rest
+const modeOf = (f) => { try { return fs.readFileSync(f, "utf8").trim(); } catch { return ""; } };
+const mode = modeOf(tool === "claude" ? path.join(process.env.CLAUDE_CONFIG_DIR || path.join(home, ".claude"), "standin-mode") : path.join(home, ".standin", tool));
+const logCall = (what) => { fs.mkdirSync(path.join(home, ".standin"), { recursive: true }); fs.appendFileSync(path.join(home, ".standin", "calls.log"), what + "\\n"); };
 if (tool === "claude") {
   const dir = process.env.CLAUDE_CONFIG_DIR || path.join(home, ".claude");
   if (a[0] === "auth") { const f = path.join(dir, "who.json"); if (fs.existsSync(f)) { process.stdout.write(fs.readFileSync(f)); process.exit(0); } j({ loggedIn: false }); process.exit(1); }
   if (a[0] === "plugin") process.exit(1);
 } else if (tool === "codex") {
+  if (a[0] === "login") { console.log(mode === "loggedout" ? "Not logged in" : "Logged in using ChatGPT"); process.exit(mode === "loggedout" ? 1 : 0); }
+  if (a[0] === "app-server") {   // stdio JSON-RPC: initialize, account/read, account/rateLimits/read
+    logCall("codex app-server");
+    const win = (pct, mins, s) => ({ usedPercent: pct, windowDurationMins: mins, resetsAt: Math.floor(Date.now() / 1000) + s });
+    let buf = ""; process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (d) => { buf += d; let i; while ((i = buf.indexOf("\\n")) >= 0) { const m = JSON.parse(buf.slice(0, i)); buf = buf.slice(i + 1);
+      if (m.id === 0) j({ id: 0, result: { userAgent: "standin" } });
+      else if (m.id === 1) j({ id: 1, result: { account: { type: "chatgpt", email: "cx@x.com", planType: "plus" }, requiresOpenaiAuth: true } });
+      else if (m.id === 2) { if (mode === "credits") j({ id: 2, error: { code: -32603, message: "rate limits unavailable" } });
+        else { const r = { limitId: "codex", primary: win(mode === "limit" ? 100 : 25, 300, 7200), secondary: win(10, 10080, 400000), rateLimitReachedType: mode === "limit" ? "primary" : null }; j({ id: 2, result: { rateLimits: r, rateLimitsByLimitId: { codex: r } } }); } } } });
+    process.stdin.on("end", () => process.exit(0));
+    await new Promise(() => {});
+  }
   if (a[0] === "debug") { j({ models: [{ slug: "gpt-6-astra", display_name: "GPT-6-Astra", description: "Frontier.", context_window: 272000, visibility: "list" }, { slug: "x", visibility: "hide" }] }); process.exit(0); }
   if (a[0] === "plugin") process.exit(1);
 } else if (tool === "cursor-agent") {
@@ -78,7 +95,24 @@ const E = {
 };
 const plain = { start() {}, tool: (x) => process.stderr.write("running " + x + "\\n"), end: (t) => console.log(t) };
 const out = stream && !brief.includes("NOSTREAM") ? E[tool] : plain;
-out.start();
+logCall(tool + " run" + (tool === "claude" ? " " + (process.env.CLAUDE_CONFIG_DIR || "-") : ""));
+// each CLI's own wording (from its docs and issue trackers) for a limit, used-up credits, and a headless auth failure
+const MSG = {
+  limit: { claude: "You've hit your limit · resets 9:40pm (UTC)", codex: "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro) or try again in 2 hours 5 minutes.",
+    "cursor-agent": "Error: You've hit your usage limit for this model. Try again in 3 hours.", agy: "RESOURCE_EXHAUSTED (429): You have exhausted your capacity on this model. Your quota will reset after 2h30m." },
+  credits: { claude: "Credit balance is too low", codex: "Quota exceeded. Check your plan and billing details.", "cursor-agent": "You're out of usage. Upgrade to Pro to keep going.", agy: "This model requires a paid plan: no active subscription" },
+  noauth: { claude: "Not logged in · Please run /login", codex: "401 Unauthorized: Your access token could not be refreshed.", "cursor-agent": "Error: Authentication required. Please run 'agent login' first, or set CURSOR_API_KEY.", agy: "UNAUTHENTICATED: not signed in" },
+};
+if (mode === "garbage") { console.log("%%%% ?? <<<>>> 0xdeadbeef"); process.stderr.write("panic: core dumped at 0xdeadbeef\\n"); process.exitCode = 3; }
+else if (MSG[mode]) {
+  const msg = MSG[mode][tool];
+  if (stream && tool === "claude") { E.claude.start(); j({ type: "result", subtype: "success", is_error: true, result: msg, session_id: sid }); }
+  else if (stream && tool === "codex") { E.codex.start(); j({ type: "error", message: msg }); j({ type: "turn.failed", error: { message: msg } }); }
+  else process.stderr.write(msg + "\\n");
+  process.exitCode = 1;
+}
+else if (brief.includes("one word: PONG")) { out.start(); out.end("PONG"); }
+else { out.start();
 if (brief.includes("SLEEP")) setTimeout(() => {}, 600000);
 else if (brief.includes("REPEAT")) setInterval(() => process.stderr.write("root agent idle; waiting for 1 background task(s) to finish\\n"), 200);
 else if (brief.includes("SPAWN")) { const c = spawn(process.execPath, ["-e", "setTimeout(() => {}, 600000)"], { stdio: "ignore" }); fs.writeFileSync("grandchild.pid", String(c.pid)); out.tool("long command"); setTimeout(() => {}, 600000); }
@@ -87,6 +121,7 @@ else {
   if (brief.includes("EDIT")) fs.writeFileSync("made.txt", "hi");
   const r = resumed ? " resumed:" + resumed : "";
   out.end(tool === "agy" ? "gemini ran: " + brief.split("\\n")[1] + r : JSON.stringify({ tool, argv: a, resumed, dir: process.env.CLAUDE_CONFIG_DIR || "default", token: process.env.CLAUDE_CODE_OAUTH_TOKEN || "none", bg: process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS || "" }));
+}
 }
 `);
 const launcher = (name, pre = "") => WIN ? mk(path.join(BINDIR, name + ".cmd"), `@echo off\r\n${pre ? `set ${pre}\r\n` : ""}node "${STANDIN}" ${name} %*\r\n`)
@@ -202,6 +237,14 @@ ok(m.state === "done" && m.code === 0 && m.sub === claude2 && m.folder === fs.re
 ok(["brief.txt", "progress.log", "answer.txt", "stdout.log", "stderr.log"].every((f) => fs.existsSync(path.join(JOBS, id, f))) && /started on m/.test(fs.readFileSync(path.join(JOBS, id, "progress.log"), "utf8")), "job folder has brief, progress, raw output and answer");
 if (!WIN) ok((fs.statSync(path.join(JOBS, id)).mode & 0o777) === 0o700, "job folder is private (0700)");
 ok(/foreground and wait/.test(fs.readFileSync(path.join(JOBS, id, "brief.txt"), "utf8")), "brief tells the sub not to start background tasks");
+{ const cf = path.join(H, ".subhub", "config.json"), c0 = fs.existsSync(cf) ? fs.readFileSync(cf, "utf8") : null;
+  mk(cf, JSON.stringify({ ...JSON.parse(c0 || "{}"), notes: "ALLSUBS-STYLE" }));
+  let q = await sh(["ask", "gemini-1", "default", "first"]); const j1 = jobOf(q);
+  const b1 = j1 ? fs.readFileSync(path.join(JOBS, j1, "brief.txt"), "utf8") : "";
+  ok(q.code === 0 && /Notes from the user for every sub:\nALLSUBS-STYLE/.test(b1), "top-level notes go into every sub's brief", q.err + b1);
+  q = await sh(["ask", "--continue", j1, "more"]); const j2 = jobOf(q);
+  ok(j2 && /ALLSUBS-STYLE/.test(fs.readFileSync(path.join(JOBS, j2, "brief.txt"), "utf8")), "top-level notes go into follow-ups too", q.err);
+  if (c0 === null) fs.rmSync(cf); else fs.writeFileSync(cf, c0); }
 r = await sh(["ask", "--continue", id, "follow up"]); let j2 = {}; try { j2 = JSON.parse(r.out.trim()); } catch {}
 const c1 = jobOf(r);
 ok(r.code === 0 && j2.resumed === m.session && j2.argv.includes("--resume") && j2.argv.includes("opus") && j2.dir.endsWith(".claude-acct2") && meta(c1).parent === id, "continue: Claude gets --resume <session>, same account and model", JSON.stringify(j2));
@@ -263,6 +306,65 @@ r = await sh(["ask", "--continue", "nope99", "x"]); ok(r.code === 2, "continue o
 mk(path.join(JOBS, "old001", "job.json"), JSON.stringify({ id: "old001", sub: "gemini-1", state: "done", started: Date.now() - 9 * 86400000, ended: Date.now() - 8 * 86400000 }));
 await sh(["jobs"]); ok(!fs.existsSync(path.join(JOBS, "old001")) && fs.existsSync(path.join(JOBS, "dead01")), "jobs older than 7 days are pruned");
 
+// 5d. health: which subs actually work (subhub check, passive learning from asks, list, ask --force)
+const rdf = (f) => { try { return fs.readFileSync(f, "utf8"); } catch { return null; } };
+const SI = path.join(H, ".standin"), CALLS = path.join(SI, "calls.log"), REGF = path.join(H, ".subhub", "registry.json");
+const MODEF = { claude2: path.join(H, ".claude-acct2", "standin-mode"), team: path.join(H, ".claude-team", "standin-mode") };
+const setMode = (tool, m) => { const f = MODEF[tool] || path.join(SI, tool); if (m) mk(f, m); else fs.rmSync(f, { force: true }); };
+const calls = () => (rdf(CALLS) || "").split("\n").filter(Boolean);
+const regH = () => Object.fromEntries(JSON.parse(rdf(REGF)).subs.map((s) => [s.name, s]));
+const teamSub = Object.values(subs).find((s) => /Acme/.test(s.label)).name;
+setMode("claude2", "limit"); setMode("codex", "credits"); setMode("cursor-agent", "noauth"); setMode("agy", "garbage");
+let c0 = calls().length, ch0 = chats.length, t2 = Date.now();
+r = await sh(["check", "--json"], { env: { CLAUDECODE: "1" } });
+const tCheck = Date.now() - t2; let ck = {}; try { ck = JSON.parse(r.out); } catch {}
+const row = Object.fromEntries((ck.subs || []).map((x) => [x.name, x])), newCalls = calls().slice(c0);
+console.log(`      check of ${ck.subs?.length} subs took ${tCheck} ms`);
+ok(Array.isArray(ck.subs) && ck.subs.length === Object.keys(regH()).length && ck.subs.every((x) => ["name", "provider", "account", "result", "reason", "resets", "how"].every((k) => k in x)), "check --json: a row per sub with name, provider, account, result, reason, resets, how", r.out + r.err);
+ok(row["claude-1"]?.result === "you" && /this is you/.test(row["claude-1"].reason) && !newCalls.includes("claude run -") && !regH()["claude-1"].health, "check: the caller's own account is not probed", JSON.stringify([row["claude-1"], newCalls]));
+ok(row[claude2]?.result === "limit" && row[claude2].resets > Date.now() && /hit your limit/.test(row[claude2].reason) && /test prompt, model haiku/.test(row[claude2].how), "check: a Claude usage-limit message is 'limit' with its reset time", JSON.stringify(row[claude2]));
+ok(row[teamSub]?.result === "working" && /test prompt/.test(row[teamSub].how), "check: a sub that answers the test prompt is working", JSON.stringify(row[teamSub]));
+ok(row["codex-1"]?.result === "nocredits" && /plan and billing/.test(row["codex-1"].reason) && newCalls.includes("codex app-server") && newCalls.includes("codex run"), "check: codex free check inconclusive, then its test prompt says out of credits", JSON.stringify([row["codex-1"], newCalls]));
+ok(row["cursor-1"]?.result === "noauth" && /Authentication required/.test(row["cursor-1"].reason), "check: Cursor signed in (status) but refused in a headless run is 'noauth'", JSON.stringify(row["cursor-1"]));
+ok(row["gemini-1"]?.result === "failing" && /core dumped/.test(row["gemini-1"].reason), "check: garbage output is 'failing' with the last error line", JSON.stringify(row["gemini-1"]));
+ok(row["ollama-1"]?.result === "working" && row["ollama-1"].how === "free check" && chats.length === ch0, "check: Ollama with a local model is working from its API alone (no prompt)", JSON.stringify(row["ollama-1"]));
+let hsr = regH();
+ok(hsr[claude2].health?.state === "limit" && hsr[claude2].health.via === "check" && hsr["codex-1"].health?.state === "nocredits" && hsr["cursor-1"].health?.state === "noauth" && hsr["gemini-1"].health?.state === "failing" && hsr[teamSub].health?.state === "working" && hsr[claude2].health.checked > t2, "check: health stored with each sub in the registry", JSON.stringify(Object.values(hsr).map((s) => [s.name, s.health])));
+ok(!fs.readdirSync(JOBS).some((d) => meta(d).probe) && !(await sh(["jobs", "--json"])).out.includes('"probe"'), "check: test prompts leave no jobs behind");
+r = await sh(["check", "gemini-1"]); ok(/^Sub\s+Account\s+Result\s+Resets\s+Reason/.test(r.out) && /gemini-1 .* failing .*core dumped/.test(r.out) && !/claude-1/.test(r.out), "check <sub>: a short table for the named sub only", r.out + r.err);
+setMode("codex", "limit"); c0 = calls().length;
+r = await sh(["check", "codex-1", "--json"]); let cx = {}; try { cx = JSON.parse(r.out).subs[0]; } catch {}
+ok(cx.result === "limit" && cx.how === "free check" && Math.abs(cx.resets - (Date.now() + 7200000)) < 120000 && calls().slice(c0).join() === "codex app-server", "check: Codex rate limits from app-server, no prompt sent (limit, reset time)", JSON.stringify([cx, calls().slice(c0)]));
+setMode("codex", "credits"); await sh(["check", "codex-1"]);
+// list, status and the hook only read the stored health
+c0 = calls().length;
+r = await sh(["list"]);
+ok(!r.out.includes(`| ${claude2} |`) && new RegExp(`${claude2} \\(at its usage limit until (\\w+ \\d+ )?\\d\\d:\\d\\d`).test(r.out) && /cursor-1 \(not authorised for headless runs: .*Authentication required/.test(r.out) && /gemini-1 \(failing/.test(r.out) && /codex-1 \(out of credits/.test(r.out) && r.out.includes(`| ${teamSub} |`) && r.out.includes("| ollama-1 |"), "list: non-working subs go under Not ready with the reason and reset time", r.out.split("## Models")[0] + r.out.split("Not ready")[1]);
+r = await sh(["status"]); ok(new RegExp(`${claude2} .*at its usage limit until`).test(r.out) && /cursor-1 .*not authorised/.test(r.out), "status shows health per sub", r.out);
+r = await sh(["status", "--json"]); st = JSON.parse(r.out);
+ok(st.subs.find((s) => s.name === claude2).health.state === "limit" && st.subs.find((s) => s.name === claude2).health.usable === false && st.subs.find((s) => s.name === teamSub).health.usable === true, "status --json shows health per sub");
+await sh(["hook", "pretool"], { input: JSON.stringify({ session_id: "h", tool_name: "Agent", tool_input: { subagent_type: "general-purpose", prompt: "p-health" } }) });
+ok(calls().length === c0, "plain list, status and the hook never start a CLI", JSON.stringify(calls().slice(c0)));
+// ask: fails fast on a known limit, --force tries anyway (and learns)
+r = await sh(["ask", claude2, "default", "hi"]);
+ok(r.code === 9 && /usage limit/.test(r.err) && /--force/.test(r.err) && calls().length === c0, "ask: a sub known to be at its limit fails fast (exit 9) without starting the CLI", `${r.code} ${r.err}`);
+r = await sh(["ask", "codex-1", "default", "hi"]); ok(r.code === 9 && /out of credits/.test(r.err), "ask: a sub known to be out of credits fails fast (exit 9)", r.err);
+r = await sh(["ask", "--force", claude2, "default", "hi"]);
+ok(r.code === 1 && calls().length === c0 + 1 && regH()[claude2].health.via === "ask" && regH()[claude2].health.state === "limit", "ask --force tries anyway, and learns the limit again from the failure", `${r.code} ${r.err} ${JSON.stringify(regH()[claude2].health)}`);
+// a passed reset time: ready again without a probe
+let regj = JSON.parse(rdf(REGF)); regj.subs.find((s) => s.name === claude2).health.resets = Date.now() - 60000; fs.writeFileSync(REGF, JSON.stringify(regj));
+c0 = calls().length; r = await sh(["list"]);
+ok(r.out.includes(`| ${claude2} |`) && !new RegExp(`${claude2} \\(`).test(r.out) && calls().length === c0, "a limit whose reset time has passed is ready again, without a probe", r.out.split("## Models")[0]);
+r = await sh(["status", "--json"]); ok(JSON.parse(r.out).subs.find((s) => s.name === claude2).health.state === "unknown", "status: after the reset time the sub's health is unknown");
+// passive learning from real asks
+setMode("agy", ""); r = await sh(["ask", "gemini-1", "default", "x\nhello"]);
+ok(r.code === 0 && regH()["gemini-1"].health?.state === "working" && regH()["gemini-1"].health.via === "ask", "passive: a normal answer marks the sub working", JSON.stringify(regH()["gemini-1"].health));
+setMode("agy", "limit"); t2 = Date.now(); r = await sh(["ask", "gemini-1", "default", "x\nhello"]); let gh = regH()["gemini-1"].health || {};
+ok(r.code === 1 && gh.state === "limit" && gh.via === "ask" && Math.abs(gh.resets - (t2 + 9000000)) < 120000 && /exhausted your capacity/.test(gh.reason), "passive: a usage-limit failure marks it so, with the reset time", JSON.stringify(gh));
+setMode("cursor-agent", ""); r = await sh(["ask", "cursor-1", "auto", "hi"]); ok(r.code === 0 && regH()["cursor-1"].health?.state === "working", "passive: a sub that was not authorised and now answers is working again");
+for (const t of ["claude2", "codex", "agy"]) setMode(t, "");
+regj = JSON.parse(rdf(REGF)); for (const s of regj.subs) delete s.health; fs.writeFileSync(REGF, JSON.stringify(regj));
+
 // 5c. Claude Code: the relay agent and the redirect hook (subhub hook pretool, PreToolUse on Agent|Task)
 const rd = (f) => { try { return fs.readFileSync(f, "utf8"); } catch { return null; } };
 const PLUG = path.join(ROOT, "plugins", "subhub"), CFGF = path.join(H, ".subhub", "config.json");
@@ -270,6 +372,7 @@ const hook = (input, { env = {}, home = H } = {}) => sh(["hook", "pretool"], { e
 const call = (type, prompt = "find the API endpoints", session = "sess-1", tool = "Agent") => ({ session_id: session, hook_event_name: "PreToolUse", tool_name: tool, cwd: WORK, tool_input: { description: "d", prompt, ...(type === undefined ? {} : { subagent_type: type }) } });
 const denied = (r) => { try { const o = JSON.parse(r.out).hookSpecificOutput; return r.code === 0 && o.hookEventName === "PreToolUse" && o.permissionDecision === "deny" && /subhub:relay/.test(o.permissionDecisionReason) && /repeat this exact call/.test(o.permissionDecisionReason); } catch { return false; } };
 const quiet = (r) => r.code === 0 && r.out === "" && r.err === "";
+const INST = path.join(H, ".subhub", "bin", "subhub.mjs"), ENGINE_SRC = fs.readFileSync(ENGINE, "utf8"); mk(INST, ENGINE_SRC);   // `subhub` on PATH, the same version
 r = await hook(call("general-purpose")); ok(denied(r), "hook: general-purpose is denied once, pointing at subhub:relay", JSON.stringify(r));
 r = await hook(call("general-purpose")); ok(quiet(r), "hook: the same call again (same session and prompt) is allowed", JSON.stringify(r));
 r = await hook(call("general-purpose", "find the API endpoints", "sess-2")); ok(denied(r), "hook: the same prompt in another session is denied once");
@@ -299,7 +402,7 @@ const reg2 = (extra = []) => mk(REG2, JSON.stringify({ refreshed: Date.now(), su
   { name: "claude-2", provider: "claude", dir: path.join(H2, ".claude-b"), email: "b@x.com", org: "org-b", label: "Claude Pro", state: "ok" },
   { name: "gemini-1", provider: "gemini", dir: "", email: "g@x.com", org: "google", label: "Google account", state: "signedout" },
   { name: "ollama-1", provider: "ollama", dir: "", email: "this computer", org: "local", label: "Ollama", state: "stopped" }, ...extra] }));
-reg2(); mk(path.join(H2, ".subhub", "config.json"), JSON.stringify({ subs: { "claude-2": { on: false } }, order: [] }));
+reg2(); mk(path.join(H2, ".subhub", "config.json"), JSON.stringify({ subs: { "claude-2": { on: false } }, order: [] })); mk(path.join(H2, ".subhub", "bin", "subhub.mjs"), ENGINE_SRC);
 r = await hook(call("general-purpose", "p-none"), { home: H2 }); ok(quiet(r), "hook: no usable sub (own account, off, signed out, stopped): allowed", JSON.stringify(r));
 r = await hook(call("general-purpose", "p-none"), { home: H2, env: { CLAUDE_CONFIG_DIR: path.join(H2, ".claude-b"), CLAUDE_CODE_USER_EMAIL: "Main@x.com", CLAUDE_CODE_ORGANIZATION_UUID: "org-main" } });
 ok(quiet(r), "hook: the caller's own account by email is not a usable sub");
@@ -308,6 +411,20 @@ r = await hook(call("general-purpose", "p-own"), { home: H2, env: { CLAUDE_CONFI
 r = await hook(call("general-purpose", "p-own"), { home: H2 }); ok(denied(r), "hook: another Claude account that is on and ok is a usable sub");
 reg2([{ name: "codex-1", provider: "codex", dir: "", email: "cx@x.com", org: "plus", label: "ChatGPT Plus", state: "ok" }]);
 r = await hook(call("general-purpose", "p-codex"), { home: H2, env: { CLAUDE_CONFIG_DIR: path.join(H2, ".claude-b") } }); ok(denied(r), "hook: a ready Codex sub makes it redirect");
+const cxh = (health) => reg2([{ name: "codex-1", provider: "codex", dir: "", email: "cx@x.com", org: "plus", label: "ChatGPT Plus", state: "ok", health }]);
+const b2 = { home: H2, env: { CLAUDE_CONFIG_DIR: path.join(H2, ".claude-b") } };
+cxh({ state: "nocredits", reason: "x", checked: Date.now() }); r = await hook(call("general-purpose", "p-h1"), b2); ok(quiet(r), "hook: a sub out of credits is not usable");
+cxh({ state: "limit", reason: "x", checked: Date.now(), resets: Date.now() + 3600000 }); r = await hook(call("general-purpose", "p-h2"), b2); ok(quiet(r), "hook: a sub at its usage limit is not usable");
+cxh({ state: "noauth", reason: "x", checked: Date.now() }); r = await hook(call("general-purpose", "p-h3"), b2); ok(quiet(r), "hook: a sub not authorised for headless runs is not usable");
+cxh({ state: "limit", reason: "x", checked: Date.now() - 7200000, resets: Date.now() - 60000 }); r = await hook(call("general-purpose", "p-h4"), b2); ok(denied(r), "hook: a sub whose limit has reset is usable again");
+const INST2 = path.join(H2, ".subhub", "bin", "subhub.mjs");
+fs.writeFileSync(INST2, ENGINE_SRC.replace(/^const VERSION = "[^"]+"/m, 'const VERSION = "0.3.0-alpha"')); r = await hook(call("general-purpose", "p-v1"), b2); ok(quiet(r), "hook: subhub on PATH is another version: allowed (the relay couldn't work)", JSON.stringify(r));
+fs.rmSync(INST2); r = await hook(call("general-purpose", "p-v2"), b2); ok(quiet(r), "hook: subhub not installed on PATH: allowed");
+fs.writeFileSync(INST2, ENGINE_SRC); r = await hook(call("general-purpose", "p-v3"), b2); ok(denied(r), "hook: same version again: redirects");
+fs.writeFileSync(INST, ENGINE_SRC.replace(/^const VERSION = "[^"]+"/m, 'const VERSION = "0.3.0-alpha"'));
+r = await sh(["status"]); ok(/Warning: .*0\.3\.0-alpha.*subhub install/.test(r.out), "status warns when subhub on PATH is another version, and names the fix", r.out);
+r = await sh(["status", "--json"]); st = JSON.parse(r.out); ok(st.engine?.installed === "0.3.0-alpha" && st.engine.drift.length === 1, "status --json reports the engine versions and the drift", JSON.stringify(st.engine));
+fs.writeFileSync(INST, ENGINE_SRC); r = await sh(["status"]); ok(!/Warning:/.test(r.out), "status: no warning when the versions match", r.out);
 r = await hook(call("general-purpose", "p-x"), { home: path.join(H, "home3") }); ok(quiet(r), "hook: no registry at all: allowed", JSON.stringify(r));
 fs.writeFileSync(REG2, "{broken"); r = await hook(call("general-purpose", "p-y"), { home: H2 }); ok(quiet(r), "hook: unreadable registry: allowed");
 // the deny-once state is pruned by age
@@ -388,8 +505,10 @@ r = await sh(["status", "--json"]); ok(JSON.parse(r.out).agents.every((a) => a.r
 r = await sh(["install"], { env: { SUBHUB_REPO: ROOT } });
 ok(fs.existsSync(path.join(H, ".subhub", "bin", "subhub.mjs")) && fs.existsSync(path.join(H, ".subhub", "bin", WIN ? "subhub.cmd" : "subhub")), "install puts the engine and launcher in ~/.subhub/bin", r.out + r.err);
 ok(r.out.includes(`always-on rule in ${CMD}`) && blocks(read(CMD)) === 1, "install writes the rule and says where", r.out);
-await sh(["disconnect", "all"]); r = await sh(["install"], { env: { SUBHUB_REPO: ROOT, SUBHUB_NO_RULES: "1" } });
+ok(/Checking which subs actually work.*test prompt/.test(r.out) && /^gemini-1 .* working/m.test(r.out), "install checks the subs and says it uses a test prompt", r.out);
+await sh(["disconnect", "all"]); r = await sh(["install", "--no-check"], { env: { SUBHUB_REPO: ROOT, SUBHUB_NO_RULES: "1" } });
 ok(read(CMD) === CMD0 && !fs.existsSync(GMD) && r.out.includes("always-on rule skipped"), "SUBHUB_NO_RULES=1 install writes no rule", r.out);
+ok(/Skipped checking/.test(r.out) && !/Checking which subs/.test(r.out), "install --no-check runs no test prompts", r.out);
 if (!WIN) { const l = spawnSync(path.join(H, ".local", "bin", "subhub"), ["version"], { env: baseEnv, encoding: "utf8" }); ok(/subhub \d/.test(l.stdout), "~/.local/bin/subhub runs", l.stderr); }
 else { const l = spawnSync("cmd.exe", ["/d", "/c", path.join(H, ".subhub", "bin", "subhub.cmd"), "version"], { env: baseEnv, encoding: "utf8" }); ok(/subhub \d/.test(l.stdout), "subhub.cmd runs", l.stderr); }
 const team = Object.values(subs).find((s) => /Acme/.test(s.label)).name;
