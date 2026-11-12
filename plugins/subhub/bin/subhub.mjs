@@ -274,7 +274,7 @@ const HEALTH_PATTERNS = {
   codex: [["limit", /hit your usage limit|usage ?limit ?(reached|exceeded)|usageLimitExceeded|exceeded the rate limit|rate limit reached/i],
     ["nocredits", /insufficient_quota|exceeded your current quota|check your plan and billing|upgrade to \w+ to continue|no credits (left|remaining)/i],
     ["noauth", /not logged in|codex login|token could not be refreshed|refresh token|401 unauthorized|unauthorized|sign in again/i]],
-  cursor: [["noauth", /authentication required|stored authentication is invalid|authentication error|not (logged|signed) in|(agent|cursor-agent) login|please log ?in/i],
+  cursor: [["noauth", /authentication required|stored authentication is invalid|authentication error|not (logged|signed) in|(agent|cursor-agent) login|please log ?in|change your role|role does not have access|ask your team admin/i],   // last three: a team seat without agent access (ActionRequiredError)
     ["limit", /hit your usage limit|usage limit|usage_limit_exceeded|rate limit/i],
     ["nocredits", /out of (credits|usage|requests)|on-demand usage (is )?(required|disabled|off)|upgrade to (pro|ultra|business)|subscription (has )?(expired|ended|inactive)/i]],
   gemini: [["failing", /model_capacity_exhausted|no capacity available|high demand/i],

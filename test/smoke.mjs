@@ -102,6 +102,7 @@ const MSG = {
     "cursor-agent": "Error: You've hit your usage limit for this model. Try again in 3 hours.", agy: "RESOURCE_EXHAUSTED (429): You have exhausted your capacity on this model. Your quota will reset after 2h30m." },
   credits: { claude: "Credit balance is too low", codex: "Quota exceeded. Check your plan and billing details.", "cursor-agent": "You're out of usage. Upgrade to Pro to keep going.", agy: "This model requires a paid plan: no active subscription" },
   noauth: { claude: "Not logged in · Please run /login", codex: "401 Unauthorized: Your access token could not be refreshed.", "cursor-agent": "Error: Authentication required. Please run 'agent login' first, or set CURSOR_API_KEY.", agy: "UNAUTHENTICATED: not signed in" },
+  role: { "cursor-agent": "ActionRequiredError: Change your role to use agents Your role does not have access to agents. Please ask your team admin to upgrade your role to use agents." },
 };
 if (mode === "garbage") { console.log("%%%% ?? <<<>>> 0xdeadbeef"); process.stderr.write("panic: core dumped at 0xdeadbeef\\n"); process.exitCode = 3; }
 else if (MSG[mode]) {
@@ -362,6 +363,7 @@ ok(r.code === 0 && regH()["gemini-1"].health?.state === "working" && regH()["gem
 setMode("agy", "limit"); t2 = Date.now(); r = await sh(["ask", "gemini-1", "default", "x\nhello"]); let gh = regH()["gemini-1"].health || {};
 ok(r.code === 1 && gh.state === "limit" && gh.via === "ask" && Math.abs(gh.resets - (t2 + 9000000)) < 120000 && /exhausted your capacity/.test(gh.reason), "passive: a usage-limit failure marks it so, with the reset time", JSON.stringify(gh));
 setMode("cursor-agent", ""); r = await sh(["ask", "cursor-1", "auto", "hi"]); ok(r.code === 0 && regH()["cursor-1"].health?.state === "working", "passive: a sub that was not authorised and now answers is working again");
+setMode("cursor-agent", "role"); r = await sh(["ask", "cursor-1", "auto", "hi"]); ok(r.code !== 0 && regH()["cursor-1"].health?.state === "noauth", "passive: a Cursor team seat without agent access is 'noauth', not 'failing'", JSON.stringify(regH()["cursor-1"].health)); setMode("cursor-agent", "");
 for (const t of ["claude2", "codex", "agy"]) setMode(t, "");
 regj = JSON.parse(rdf(REGF)); for (const s of regj.subs) delete s.health; fs.writeFileSync(REGF, JSON.stringify(regj));
 
