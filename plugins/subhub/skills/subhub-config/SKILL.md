@@ -24,16 +24,20 @@ Edit only this file, with your file-edit tool so the user sees the change. Keep 
 
 | Field | Meaning |
 |---|---|
-| `on` | false: no agent uses it, and `subhub ask` refuses it |
+| `on` | false: no agent uses it, and `subhub ask` refuses it. `subhub off <sub>` also stops that sub's running jobs |
 | `use_for` | what agents should use it for, one sentence; empty = SubHub's default |
 | `model` | used when an agent passes default; an id from `subhub models <sub>` (Claude: fable, opus, sonnet, haiku) |
 | `notes` | added to every brief for this sub, under 2,000 characters |
 | `order` | sub names, most preferred first |
 | `notes` (top level) | added to every brief for every sub, follow-ups included. Use it for rules all subs should follow, such as an answer style (terse "caveman" replies). Sub hooks are off, so a style plugin in the sub's own agent doesn't load: put the style here |
 | `hook` | Claude Code only. false: turns off the redirect hook that sends generic built-in sub-agents (general-purpose, Explore) to the `subhub:relay` agent. Default on. `SUBHUB_HOOK=0` in the environment also turns it off |
+| `statusline` | Claude Code only. false: don't put SubHub's tap in front of the Claude Code status line (the tap records the session account's usage and reset times, then runs the user's own status line). `connect claude --no-statusline` or `SUBHUB_STATUSLINE=0` also skip it |
 | `hook_types` | Claude Code only. The sub-agent types the hook redirects, replacing the default `["general-purpose", "Explore", "claude", ""]` (`""` = a call with no type) |
 
 Changes apply on the next `subhub ask` call.
+
+## Updating the agent CLIs
+`subhub update [claude|codex|gemini|cursor|all] [--dry-run]` updates the CLIs with their own update commands and re-reads the model lists. It installs software, so run it only when the user asks; show `--dry-run` first if unsure. It skips CLIs with running jobs.
 
 ## Accounts and agents (tell the user to run these in a terminal: sign-ins are interactive)
 - Sign a sub in again: `subhub signin <sub>`

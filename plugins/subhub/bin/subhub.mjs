@@ -8,6 +8,13 @@
 //   subhub check [sub…] [--json]       which subs actually work: free CLI checks (auth, rate limits), then one tiny test
 //                                      prompt per sub where those can't tell (costs a little usage; only check, install
 //                                      and list --refresh ever do this). ask learns it from every real run for free
+//   subhub usage [--json] [--refresh]  every account's limit windows (5h, weekly, per model group), used %, reset
+//                                      times, free parallel slots, and advice for the caller's own account
+//   subhub statusline                  Claude Code status line tap: records the session account's rate limits, then
+//                                      runs the user's own status line (connect claude installs it; --no-statusline skips)
+//   subhub update [claude|codex|gemini|cursor|ollama|all] [--dry-run] [--force]
+//                                      update the agent CLIs with their own update command, then re-read model lists
+//                                      (skips a CLI with running jobs unless --force; never runs on its own)
 //   subhub models <sub>                every model that sub offers
 //   subhub ask [--bg] [--force] [--in <folder>] <sub> <model|default> [brief | --brief-file <file> | brief on stdin]
 //                                      (--force: try a sub known to be at its limit or out of credits anyway)
@@ -33,7 +40,7 @@ import crypto from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-const VERSION = "0.6.0-alpha";
+const VERSION = "0.8.0-alpha";
 const WIN = process.platform === "win32", MAC = process.platform === "darwin";
 const HOME = os.homedir();
 const SH = path.join(HOME, ".subhub"), REG = path.join(SH, "registry.json"), CFG = path.join(SH, "config.json");
@@ -133,9 +140,15 @@ function cursorWho(bin) {
   const out = run(bin, ["status"]).out.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
   const e = out.match(/Logged in as\s+(\S+)/)?.[1]; if (!e) return null;
   const team = out.match(/^Team:\s*(.*?)\s*\(id/m)?.[1];
-  const models = run(bin, ["--list-models"], { timeout: 60000 }).out.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").replace(/​/g, "");
-  fs.writeFileSync(path.join(CACHE, "cursor-models.txt"), models);
+  // the model list takes up to a minute: only when it's missing, a day old, or the Cursor sub is on and it's 6 hours old (subhub update always re-reads it)
+  const name = loadReg().subs.find((x) => x.provider === "cursor")?.name, f = path.join(CACHE, "cursor-models.txt");
+  let age = Infinity; try { age = Date.now() - fs.statSync(f).mtimeMs; } catch {}
+  if (age > 86400000 || (age > 21600000 && (!name || isOn(name)))) listCursorModels(bin);
   return { email: e.toLowerCase(), org: team || "personal", label: "Cursor" + (team ? ` · ${team}` : "") };
+}
+function listCursorModels(bin) {
+  const r = run(bin, ["--list-models"], { timeout: 60000 }), models = r.out.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").replace(/\u200b/g, "");
+  if (r.code === 0 && / - /.test(models)) fs.writeFileSync(path.join(CACHE, "cursor-models.txt"), models);
 }
 function geminiWho(bin) {
   const r = run(bin, ["models"], { timeout: 60000 });
@@ -268,7 +281,7 @@ function setHealth(name, h, via) {
 // Each CLI's own wording for "can't work right now", as [state, pattern]; the first match wins, provider rows before the common ones.
 // Sources: vendor docs and issue trackers (README, "Which subs actually work"). Loose and case-insensitive on purpose; add rows here.
 const HEALTH_PATTERNS = {
-  claude: [["limit", /usage limit reached|hit your (\w+ )?limit|(session|weekly|5-hour|opus|sonnet) limit reached|out of extra usage|limit will reset|rate_limit_error/i],
+  claude: [["limit", /usage limit reached|hit your ([\w-]+ )?limit|(session|weekly|5-hour|opus|sonnet) limit reached|out of extra usage|limit will reset|rate_limit_error/i],
     ["nocredits", /credit balance is too low|extra usage (is )?(disabled|not enabled|off)|no active subscription|subscription (has )?(expired|ended|lapsed|been cancell?ed|inactive)/i],
     ["noauth", /not logged in|please run \/login|invalid api key|oauth token (has )?(expired|been revoked|revoked)|authentication_error|invalid bearer token/i]],
   codex: [["limit", /hit your usage limit|usage ?limit ?(reached|exceeded)|usageLimitExceeded|exceeded the rate limit|rate limit reached/i],
@@ -350,6 +363,244 @@ function learn(j) {
   try { setHealth(j.sub, classify(j.provider, outcome(j)), "ask"); } catch {}
 }
 
+// ---------------------------------------------------------------- usage: how much of each limit window is used, and when it resets
+// Kept in ~/.subhub/usage.json, apart from the registry, because the Claude Code status line writes it every few seconds.
+// { "<sub>": { windows: { "<id>": { label, group, used (0-100), resets (ms), seen } }, seen, via, perJob } }
+// Sources (all free, no prompt): Claude's `rate_limit_event` in every stream-json run, Claude Code's status line input
+// (`rate_limits`, for the account a session runs on), `codex app-server` account/rateLimits/read, `agy -p /quota`.
+// Cursor reports nothing; Ollama Cloud only says used up or not. A window whose reset time has passed counts as unused.
+const USAGE = path.join(SH, "usage.json"), STATUS_TAP = path.join(SH, "statusline.json");
+let usageCache = null;
+const loadUsage = (fresh) => { if (fresh || !usageCache) usageCache = readJSON(USAGE) || {}; return usageCache; };
+/** Records windows for a sub: [{ id, label, group?, used, resets }]. Returns true when anything changed. */
+function noteUsage(name, wins, via, extra = {}) {
+  wins = (wins || []).filter((w) => w && w.id && Number.isFinite(w.used));
+  if (!name || (!wins.length && !Object.keys(extra).length)) return false;
+  const all = loadUsage(true), u = all[name] ||= { windows: {} }, now = Date.now();
+  let changed = false;
+  for (const w of wins) {
+    const old = u.windows[w.id], nw = { label: w.label || w.id, group: w.group || "", used: Math.max(0, Math.round(w.used * 10) / 10), resets: w.resets || null, seen: now };
+    if (!old || old.used !== nw.used || old.resets !== nw.resets) changed = true;
+    u.windows[w.id] = nw;
+  }
+  for (const [k, v] of Object.entries(extra)) if (u[k] !== v) { u[k] = v; changed = true; }
+  if (!changed && u.seen && now - u.seen < 60000) return false;   // nothing new: write at most once a minute
+  Object.assign(u, { seen: now, via }); writeJSON(USAGE, all); return changed;
+}
+const winLabel = (mins) => !mins ? "window" : mins >= 10080 ? "7d" : mins % 60 ? `${mins}m` : `${mins / 60}h`;
+/** Claude stream-json rate_limit_info → windows. unifiedWindows: five_hour, seven_day, and per-model weekly ones. */
+function claudeWindows(info) {
+  const out = [], uw = info?.unifiedWindows && typeof info.unifiedWindows === "object" ? info.unifiedWindows : {};
+  const name = (k) => k === "five_hour" ? "5h" : k === "seven_day" ? "7d" : k.replace(/^seven_day_/, "7d ").replace(/_/g, " ");
+  for (const [k, w] of Object.entries(uw)) if (w && typeof w.utilization === "number") out.push({ id: name(k), label: name(k), used: w.utilization * 100, resets: w.resetsAt ? w.resetsAt * 1000 : null });
+  if (!out.length && typeof info?.utilization === "number" && info.rateLimitType) out.push({ id: name(info.rateLimitType), label: name(info.rateLimitType), used: info.utilization * 100, resets: info.resetsAt ? info.resetsAt * 1000 : null });
+  return out;
+}
+/** Claude Code status line input `rate_limits` → windows. */
+function statuslineWindows(rl) {
+  const out = [];
+  for (const [k, id] of [["five_hour", "5h"], ["seven_day", "7d"], ["spend_limit", "spend"]]) {
+    const w = rl?.[k]; if (w && typeof w.used_percentage === "number") out.push({ id, label: id === "spend" ? `spend${w.period ? " (" + w.period + ")" : ""}` : id, used: w.used_percentage, resets: w.resets_at ? w.resets_at * 1000 : null });
+  }
+  return out;
+}
+/** Codex rate-limit buckets (app-server camelCase or exec --json snake_case) → windows. */
+function codexWindows(buckets) {
+  const out = [];
+  for (const b of buckets) {
+    const lim = b.limitId || b.limit_id || b.limit_name || b.limitName || "codex", group = /^codex(_primary)?$/.test(lim) ? "" : lim;
+    for (const k of ["primary", "secondary"]) {
+      const w = b[k]; const used = w?.usedPercent ?? w?.used_percent; if (typeof used !== "number") continue;
+      const mins = w.windowDurationMins ?? w.window_minutes, at = w.resetsAt ?? w.resets_at, l = winLabel(mins);
+      out.push({ id: group ? `${group} ${l}` : l, label: group ? `${group} ${l}` : l, group, used, resets: at ? at * 1000 : null });
+    }
+  }
+  return out;
+}
+/** Finds a `rate_limits` object anywhere in a Codex exec --json event. */
+function findRateLimits(e, d = 0) {
+  if (!e || typeof e !== "object" || d > 4) return null;
+  if (e.rate_limits && typeof e.rate_limits === "object") return e.rate_limits;
+  for (const v of Object.values(e)) { const r = findRateLimits(v, d + 1); if (r) return r; }
+  return null;
+}
+/** Antigravity: `agy -p /quota --output-format json` (no turn, no tokens) → windows, per model group. */
+function agyQuota(s) {
+  return new Promise((resolve) => {
+    const bin = binFor("gemini"); if (!bin) return resolve(null);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "subhub-quota-")), p = prep(bin, ["-p", "/quota", "--output-format", "json"]);
+    let out = "", c; const end = (v) => { clearTimeout(t); if (c?.pid) killTree(c.pid); fs.rmSync(dir, { recursive: true, force: true }); resolve(v); };
+    const t = setTimeout(() => end(null), 30000);
+    try { c = spawn(p.cmd, p.args, { ...p.opts, cwd: dir, env: envFor("gemini", s.dir), stdio: ["ignore", "pipe", "ignore"], windowsHide: true, detached: !WIN }); } catch { return end(null); }
+    c.stdout.setEncoding("utf8"); c.stdout.on("data", (d) => (out += d)); c.on("error", () => end(null));
+    c.on("close", () => {
+      let j; try { j = JSON.parse(out.slice(out.indexOf("{"))); } catch { return end(null); }
+      const groups = j?.command?.data?.groups; if (!Array.isArray(groups)) return end(null);
+      const wins = [];
+      groups.forEach((g, gi) => { for (const b of g.buckets || []) {
+        if (b.disabled || typeof b.remaining_fraction !== "number") continue;
+        const l = b.window === "weekly" ? "7d" : b.window || b.id, short = /gemini/i.test(g.name) ? "Gemini" : /claude|gpt/i.test(g.name) ? "Claude/GPT" : g.name;
+        wins.push({ id: b.id || `${short} ${l}`, label: gi === 0 ? l : `${short} ${l}`, group: gi === 0 ? "" : short, used: (1 - b.remaining_fraction) * 100, resets: Date.parse(b.reset_time) || null });
+      } });
+      end(wins);
+    });
+  });
+}
+/** Reads every sub's usage that can be read for free (Codex, Antigravity). Claude comes from runs and the status line. */
+async function readUsage(reg, names = []) {
+  await Promise.all(reg.subs.filter((s) => (!names.length || names.includes(s.name)) && s.state === "ok" && isOn(s.name)).map(async (s) => {
+    try {
+      if (s.provider === "gemini") { const w = await agyQuota(s); if (w) noteUsage(s.name, w, "quota"); }
+      else if (s.provider === "codex" && binFor("codex")) { const h = await codexLimits(binFor("codex"), s.dir); if (h?.usage) noteUsage(s.name, h.usage, "rate limits"); }
+    } catch {}
+  }));
+}
+/** Re-reads Codex and Antigravity usage when it's older than 10 minutes (free, a few seconds; agents read it to plan). */
+async function refreshStaleUsage(reg, maxAge = 600000) {
+  const now = Date.now(), all = loadUsage(true);
+  const names = reg.subs.filter((s) => ["codex", "gemini"].includes(s.provider) && s.state === "ok" && isOn(s.name) && !(all[s.name]?.seen > now - maxAge)).map((s) => s.name);
+  if (names.length) await Promise.race([readUsage(reg, names), sleep(35000)]);
+  loadUsage(true);
+}
+async function cmdUsage(args) {
+  const reg = await fresh(false), now = Date.now();
+  if (args.includes("--refresh")) { await readUsage(reg); loadUsage(true); } else await refreshStaleUsage(reg);
+  const host = reg.subs.find((s) => isCaller(s)), run = runningJobs();
+  const rows = reg.subs.map((s) => { const u = usageOf(s.name, now); return { name: s.name, provider: s.provider, account: s.email, on: isOn(s.name), you: s === host, running: run[s.name] || 0,
+    windows: u?.wins || [], left: u?.left ?? null, seen: u?.seen || null, via: u?.via || null, perJob: u?.perJob || null, freeSlots: s === host ? null : slots(u, run[s.name] || 0), expiring: expiring(u, now) }; });
+  if (args.includes("--json")) { console.log(JSON.stringify({ version: VERSION, now, host: host?.name || null, advice: hostAdvice(host, now), subs: rows })); return; }
+  for (const r of rows) console.log(`${r.name.padEnd(10)} ${(r.you ? "(you) " : r.on ? "" : "(off) ").padEnd(7)}${r.provider === "cursor" ? "Cursor doesn't report usage" : r.provider === "ollama" ? "Ollama doesn't report usage" : usageText(usageOf(r.name, now), now)}${r.seen ? `  [${r.via}, ${ago(now - r.seen)} ago]` : ""}`);
+  const a = hostAdvice(host, now); if (a.text) console.log("\n" + a.text);
+}
+/** A sub's usage now: windows with passed reset times count as unused; `left` is the headroom of its main windows. */
+function usageOf(name, now = Date.now()) {
+  const u = loadUsage()[name]; if (!u?.windows) return null;
+  const wins = Object.entries(u.windows).map(([id, w]) => {
+    const reset = w.resets && w.resets <= now;
+    return { id, label: w.label || id, group: w.group || "", used: reset ? 0 : Math.min(100, w.used), resets: reset ? null : w.resets, wasReset: !!reset, seen: w.seen };
+  }).sort((a, b) => (a.group > b.group ? 1 : a.group < b.group ? -1 : 0) || (a.resets || Infinity) - (b.resets || Infinity));
+  const main = wins.filter((w) => !w.group && w.id !== "spend");
+  if (!main.length) return { wins, left: null, bind: null, seen: u.seen, via: u.via, perJob: u.perJob || null };
+  const bind = main.reduce((a, b) => (100 - b.used < 100 - a.used || (b.used === a.used && (b.resets || Infinity) < (a.resets || Infinity)) ? b : a));
+  return { wins, left: Math.max(0, 100 - bind.used), bind, five: main.find((w) => w.id === "5h") || null, seen: u.seen, via: u.via, perJob: u.perJob || null };
+}
+const inTime = (ms, now = Date.now()) => { const d = Math.max(0, ms - now); return d >= 172800000 ? `${Math.floor(d / 86400000)}d ${Math.floor(d / 3600000) % 24}h` : ago(d).replace(/ \d+s$/, "").replace(/^(\d+)m \d+s$/, "$1m"); };
+const usageText = (u, now = Date.now()) => !u ? "not known yet" : u.wins.map((w) => `${w.label} ${Math.round(w.used)}% used${w.resets ? `, resets ${when(w.resets)} (in ${inTime(w.resets, now)})` : w.wasReset ? " (reset since)" : ""}`).join(" · ");
+/** Running jobs per sub. */
+function runningJobs() { const n = {}; for (const id of ls(JOBS)) { const j = jload(id); if (j && j.state === "running" && !j.probe) n[j.sub] = (n[j.sub] || 0) + 1; } return n; }
+/** How many more jobs a sub can take in parallel now: learned cost per job where known, else a rule of thumb on its headroom. */
+function slots(u, running = 0) {
+  if (!u || u.left === null) return Math.max(0, 2 - running);
+  let n;
+  if (u.perJob > 0 && u.five) n = Math.floor((100 - u.five.used) / u.perJob);
+  else n = u.left >= 70 ? 3 : u.left >= 40 ? 2 : u.left >= 10 ? 1 : 0;
+  return Math.max(0, Math.min(n, u.left >= 5 ? 6 : 0) - running);
+}
+/** Headroom about to be lost: unused share of the binding window that resets within 2 hours. */
+const expiring = (u, now = Date.now()) => !!(u?.bind?.resets && u.bind.resets - now <= 7200000 && u.left >= 30);
+/** Sort key for ready subs: headroom that expires soon first, then most headroom; unknown usage after known. */
+function usageRank(a, b, now = Date.now()) {
+  const ua = usageOf(a.name, now), ub = usageOf(b.name, now), ka = ua?.left != null, kb = ub?.left != null;
+  if (ka !== kb) return ka ? -1 : 1;
+  if (!ka) return 0;
+  const ea = expiring(ua, now), eb = expiring(ub, now);
+  if (ea !== eb) return ea ? -1 : 1;
+  if (ea) return ua.bind.resets - ub.bind.resets;   // both expiring: the one that resets first
+  return ub.left - ua.left;
+}
+/** Advice for the account the calling agent runs on. mode: spend (it resets soon with room left: use it now),
+ * save (near a limit: delegate everything), normal, unknown. */
+function hostAdvice(host, now = Date.now()) {
+  if (!host) return { mode: "unknown", text: "" };
+  const u = usageOf(host.name, now), who = `Your own account (${host.name}, ${host.email})`;
+  if (!u || u.left === null) return { mode: "unknown", text: `${who}: usage not known yet. It shows up after your Claude Code status line runs once with SubHub connected (Claude Pro/Max only).` };
+  const five = u.five, week = u.wins.find((w) => w.id === "7d" && !w.group);
+  if ((five && five.used >= 85) || (week && week.used >= 90)) {
+    const w = five && five.used >= 85 ? five : week;
+    return { mode: "save", text: `${who} is at ${Math.round(w.used)}% of its ${w.label} limit${w.resets ? `, resets ${when(w.resets)} (in ${inTime(w.resets, now)})` : ""}. Hand every delegable piece to subs and keep your own turns short until then.` };
+  }
+  if (five?.resets && five.resets - now <= 4500000 && five.used <= 60 && (!week || week.used < 80))
+    return { mode: "spend", text: `${who} has ${Math.round(100 - five.used)}% of its 5h window left and it resets ${when(five.resets)} (in ${inTime(five.resets, now)}); what's unused then is lost. Use it now: your own built-in sub-agents are fine until the reset. Subs still take extra parallel work.` };
+  return { mode: "normal", text: `${who}: ${usageText(u, now)}. Delegate as usual to save it.` };
+}
+/** The "Usage and plan" section of subhub list: windows and resets per sub, parallel slots, what to use first. */
+function planLines(reg, ready, now = Date.now()) {
+  const out = ["", "## Usage and plan", "", "Aim: use every ready sub fully. Run independent pieces in parallel across subs, up to each sub's free slots; give the most work to subs whose headroom resets soonest (unused headroom is lost at reset). Before a big batch, run `subhub usage` again: it updates as jobs run."];
+  const host = reg.subs.find((s) => isCaller(s)), run = runningJobs();
+  const adv = hostAdvice(host, now); if (adv.text) out.push("", adv.text);
+  out.push("");
+  let total = 0; const first = [];
+  for (const s of ready) {
+    if (s === host) continue;
+    const u = usageOf(s.name, now), n = slots(u, run[s.name] || 0); total += n;
+    if (expiring(u, now)) first.push(`${s.name} (${Math.round(u.left)}% unused, resets ${when(u.bind.resets)})`);
+    const extra = [run[s.name] ? `${run[s.name]} running` : "", `${n} free slot${n === 1 ? "" : "s"}`, u?.perJob ? `about ${Math.round(u.perJob * 10) / 10}% of 5h per job` : ""].filter(Boolean).join(", ");
+    out.push(`- **${s.name}**: ${s.provider === "cursor" ? "Cursor doesn't report usage" : s.provider === "ollama" ? "Ollama doesn't report usage (local models are free)" : usageText(u, now)}${u?.seen ? ` (seen ${ago(now - u.seen)} ago)` : ""}. ${extra}.`);
+  }
+  if (first.length) out.push("", `Use first (headroom expires soon): ${first.join(", ")}.`);
+  out.push("", `Right now about ${total} more sub job${total === 1 ? "" : "s"} can run in parallel. A sub over 85% of a window: one small job at most. A window used up: that sub is listed under "Not ready".`);
+  return out;
+}
+/** A main window that is used up marks the sub as at its limit until that window resets. */
+function limitFromUsage(name, wins, via) {
+  const w = (wins || []).filter((x) => !x.group && x.id !== "spend" && x.used >= 99.5).sort((a, b) => (b.resets || 0) - (a.resets || 0))[0];
+  if (w) setHealth(name, { state: "limit", reason: `${w.label} limit used up`, resets: w.resets }, via);
+}
+/** Per-job cost on Claude: how much of the 5h window one job used (moving average), from the job's first and last rate-limit events. */
+function learnCost(name, a, b) {
+  if (!a || !b || a.resets !== b.resets) return;
+  const d = b.used - a.used; if (!(d > 0) || d > 60) return;
+  const old = loadUsage(true)[name]?.perJob; noteUsage(name, [], "ask", { perJob: Math.round((old ? old * 0.7 + d * 0.3 : d) * 100) / 100 });
+}
+
+// Claude Code status line tap: `subhub statusline` reads the status line input (which carries `rate_limits` for the
+// session's account), records it, then runs the user's own status line command with the same input and prints its output.
+const tapCommand = () => `node "${path.join(BIN, "subhub.mjs")}" statusline`;
+const isTap = (c) => typeof c === "string" && /subhub(\.mjs)?"?\s+statusline\b/.test(c);
+async function cmdStatusline() {
+  const input = readStdin(), dir = real(process.env.CLAUDE_CONFIG_DIR || path.join(HOME, ".claude"));
+  try {
+    const j = JSON.parse(input), wins = statuslineWindows(j?.rate_limits);
+    if (wins.length) {
+      const reg = readJSON(REG), s = reg?.subs?.find((x) => x.provider === "claude" && real(x.dir || path.join(HOME, ".claude")) === dir);
+      if (s) noteUsage(s.name, wins, "statusline");
+    }
+  } catch {}
+  const orig = (readJSON(STATUS_TAP) || {})[dir];
+  if (orig?.command && !isTap(orig.command)) {
+    const r = spawnSync(orig.command, { shell: true, input, encoding: "utf8", timeout: 5000, env: process.env, windowsHide: true });
+    if (r.stdout) process.stdout.write(r.stdout);
+  }
+}
+function statusTapState() {
+  const on = [], off = []; if (!binFor("claude")) return { on, off };
+  for (const d of tapDirs()) { if (!pexist(d)) continue; (isTap(readJSON(path.join(d, "settings.json"))?.statusLine?.command) ? on : off).push(d.replace(HOME, "~")); }
+  return { on, off };
+}
+/** The Claude config folders SubHub taps (status line): the default one and every Claude sub's own folder. */
+const tapDirs = () => [...new Set([path.join(HOME, ".claude"), ...(loadReg().subs || []).filter((s) => s.provider === "claude" && s.dir).map((s) => s.dir)].map(real))];
+const tapOff = () => cfg().statusline === false || /^(0|off|false|no)$/i.test(process.env.SUBHUB_STATUSLINE || "");
+/** Puts the tap in front of each folder's status line (keeping the user's command, run after it), or takes it out. */
+function statusTap(on) {
+  const state = readJSON(STATUS_TAP) || {}, done = [];
+  for (const dir of tapDirs()) {
+    if (!pexist(dir)) continue;
+    const f = path.join(dir, "settings.json"), o = readJSON(f) || {}, cur = o.statusLine;
+    if (on) {
+      if (cur && isTap(cur.command)) { done.push(dir); continue; }
+      state[dir] = cur && typeof cur === "object" ? cur : null;
+      o.statusLine = { ...(cur && typeof cur === "object" ? cur : {}), type: "command", command: tapCommand() };
+    } else {
+      if (!cur || !isTap(cur.command)) { delete state[dir]; continue; }
+      if (state[dir]) o.statusLine = state[dir]; else delete o.statusLine;
+      delete state[dir];
+    }
+    writeJSON(f, o); done.push(dir);
+  }
+  writeJSON(STATUS_TAP, state);
+  return done;
+}
+
 // ---------------------------------------------------------------- check: free CLI checks first, a tiny test prompt only where needed
 const PROBE = "Reply with exactly one word: PONG. Don't use any tools.", PROBE_SECS = 75;
 /** Codex: `codex login status`, then `codex app-server` (stdio JSON-RPC) account/read and account/rateLimits/read. No prompt, no usage. */
@@ -373,9 +624,10 @@ function codexLimits(bin, dir) {
         if (!full.length && b.rateLimitReachedType) full = ws.filter(([k]) => k === b.rateLimitReachedType).concat(ws.filter(([k]) => k === "primary")).slice(0, 1);
         for (const [, w] of full) { const r = w.resetsAt ? w.resetsAt * 1000 : null; if (!hit || (r || 0) > (hit.resets || 0)) hit = { state: "limit", reason: `codex rate limits: ${win(w)} limit${b.limitId && b.limitId !== "codex" ? ` (${b.limitId})` : ""} used up${b.rateLimitReachedType ? ` (${b.rateLimitReachedType})` : ""}`, resets: r }; }
       }
-      if (hit) return hit;
+      const usage = codexWindows(buckets);
+      if (hit) return { ...hit, usage };
       if (!used.length) return null;
-      return { state: "working", reason: `codex rate limits OK (${[...new Set(used)].join(", ")}${a?.account?.planType ? `; plan ${a.account.planType}` : ""}), no prompt sent` };
+      return { usage, state: "working", reason: `codex rate limits OK (${[...new Set(used)].join(", ")}${a?.account?.planType ? `; plan ${a.account.planType}` : ""}), no prompt sent` };
     };
     try { c = spawn(p.cmd, p.args, { ...p.opts, env: envFor("codex", dir), stdio: ["pipe", "pipe", "ignore"], windowsHide: true, detached: !WIN }); } catch { return end(null); }
     c.on("error", () => end(null)); c.on("close", () => end(sum())); c.stdin.on("error", () => {});
@@ -441,6 +693,10 @@ function probe(s) {
       let h;
       if (!j) h = code === 3 ? { state: "unknown", reason: "can't test from inside a sub" } : [7, 10].includes(code) ? { state: "noauth", reason: last } : { state: "failing", reason: last };   // refused before it ran
       else h = classify(s.provider, { ...outcome(j), answer: out.trim() || jtext(id, "answer.txt") }, true);
+      if (j && h.state !== "limit") {   // the run's own rate-limit events may have shown a used-up window that the answer didn't put in words
+        const now = loadReg().subs.find((x) => x.name === s.name)?.health;
+        if (now?.state === "limit" && now.checked >= j.started) h = { state: "limit", reason: now.reason, resets: now.resets };
+      }
       if (id) fs.rmSync(path.join(JOBS, id), { recursive: true, force: true });
       fs.rmSync(dir, { recursive: true, force: true });
       resolve({ ...h, model });
@@ -460,6 +716,8 @@ async function checkSubs(names = []) {
     if (s.state === "stopped") return skip("stopped", "Ollama isn't running (SubHub never starts it)");
     const me = isCaller(s); if (me) return skip("you", `this is you (${me}), not checked`);
     let h = await freeCheck(s), how = "free check";
+    if (h?.usage) noteUsage(s.name, h.usage, "rate limits");
+    if (s.provider === "gemini") { const w = await agyQuota(s); if (w) { noteUsage(s.name, w, "quota"); const lim = w.find((x) => !x.group && x.used >= 99.5); if (lim) h = { state: "limit", reason: `Antigravity ${lim.label} limit used up (/quota)`, resets: lim.resets }; } }
     if (!h) { h = await probe(s); how = `test prompt, model ${h.model}`; }
     return Object.assign(row, { result: h.state, reason: h.reason, resets: h.resets || null, how, health: h.state === "unknown" ? null : h });
   }));
@@ -487,7 +745,9 @@ const CLAUDE_MODELS = [
 function models(s, short) {
   const cache = (f) => { try { return fs.readFileSync(path.join(CACHE, f), "utf8"); } catch { return ""; } };
   switch (s.provider) {
-    case "claude": return CLAUDE_MODELS.map(([id, d]) => `- \`${id}\`: ${d}`);
+    case "claude": { const al = readJSON(path.join(CACHE, "claude-aliases.json")) || {};
+      return CLAUDE_MODELS.map(([id, d]) => { const k = id.replace(/^'|'$/g, ""), a = al[k]; return `- \`${id}\`: ${d}${a ? ` (last ran as ${a.model})` : ""}`; })
+        .concat(al.default ? [`- \`default\`: the account's own default (last ran as ${al.default.model})`] : []); }
     case "gemini": return cache("gemini-models.txt").split("\n").filter((l) => l.includes("\t")).map((l) => {
       const [id, name] = l.split("\t"); let n = "";
       if (/^gemini-.*flash/.test(id)) n = ". 1M-token context; reads images, audio and video";
@@ -514,6 +774,75 @@ function models(s, short) {
   return [];
 }
 
+// ---------------------------------------------------------------- update: the agent CLIs SubHub drives, then their model lists
+// Each CLI updates itself with its own command, found in its --help (claude update, codex update, agy update,
+// cursor-agent update). Runs only on `subhub update`, never on its own. Ollama updates itself (its app or package manager).
+const UPDATE_ORDER = ["claude", "codex", "gemini", "cursor", "ollama"];
+const UPDATE_ALIAS = { agy: "gemini", antigravity: "gemini", "cursor-agent": "cursor" };
+const cliVersion = (bin) => { const r = run(bin, ["--version"], { timeout: 20000 }); return ((r.out + r.err).match(/\d+(?:\.\d+)+(?:[-+.][\w.-]+)?/) || [""])[0]; };
+/** How the CLI was installed, from where its binary really lives: a package manager's upgrade command, or "". */
+function pkgUpgrade(bin) {
+  const p = real(bin).replace(/\\/g, "/");
+  let m = p.match(/\/(?:Cellar|Caskroom)\/([^/]+)\//); if (m) return `brew upgrade ${m[1]}`;
+  m = p.match(/\/node_modules\/((?:@[^/]+\/)?[^/]+)\//); if (m) return `npm install -g ${m[1]}@latest`;
+  return "";
+}
+/** The CLI's own update subcommand, if its --help lists one. */
+function updaterOf(bin) {
+  const h = run(bin, ["--help"], { timeout: 30000 }), t = (h.out + h.err).replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
+  return (t.match(/^\s*(update|upgrade)(?:\|(?:update|upgrade))?\b/m) || [])[1] || "";
+}
+/** Model lists: Cursor's --list-models, Antigravity's `agy models`, Ollama's /api/tags (Codex and Claude are read live). */
+async function refreshModels() {
+  const before = {}, after = {}, ids = { cursor: () => modelIds("cursor"), gemini: () => modelIds("gemini"), ollama: () => modelIds("ollama") };
+  for (const [p, f] of Object.entries(ids)) before[p] = f();
+  let b;
+  if ((b = binFor("cursor"))) listCursorModels(b);
+  if ((b = binFor("gemini"))) { const r = run(b, ["models"], { timeout: 60000 }); if (r.code === 0 && r.out.trim()) fs.writeFileSync(path.join(CACHE, "gemini-models.txt"), r.out); }
+  const om = await ollamaModels(); if (om) writeJSON(path.join(CACHE, "ollama-models.json"), om);
+  for (const [p, f] of Object.entries(ids)) after[p] = f();
+  return Object.keys(ids).map((p) => ({ provider: p, count: after[p].length, added: after[p].filter((x) => !before[p].includes(x)), removed: before[p].filter((x) => !after[p].includes(x)) }));
+}
+function modelIds(p) {
+  const cache = (f) => { try { return fs.readFileSync(path.join(CACHE, f), "utf8"); } catch { return ""; } };
+  if (p === "cursor") return cache("cursor-models.txt").split("\n").map((l) => l.match(/^(\S+) - /)?.[1]).filter(Boolean);
+  if (p === "gemini") return cache("gemini-models.txt").split("\n").filter((l) => l.includes("\t")).map((l) => l.split("\t")[0].trim()).filter(Boolean);
+  return (readJSON(path.join(CACHE, "ollama-models.json")) || []).map((m) => m.name);
+}
+async function cmdUpdate(args) {
+  const dry = args.includes("--dry-run"), force = args.includes("--force");
+  const want = args.filter((a) => !a.startsWith("--")).map((a) => UPDATE_ALIAS[a.toLowerCase()] || a.toLowerCase());
+  for (const w of want) if (w !== "all" && !UPDATE_ORDER.includes(w)) die(2, `unknown CLI '${w}': claude, codex, gemini (agy), cursor (cursor-agent), ollama or all.`);
+  const list = !want.length || want.includes("all") ? UPDATE_ORDER : UPDATE_ORDER.filter((p) => want.includes(p));
+  const reg = loadReg(), run0 = runningJobs(), busy = {};
+  for (const [sub, n] of Object.entries(run0)) { const p = reg.subs.find((s) => s.name === sub)?.provider; if (p) (busy[p] ||= []).push(`${sub} (${n} running)`); }
+  const rows = [];
+  for (const p of list) {
+    const bin = binFor(p), name = BINARY[p];
+    if (!bin) { rows.push({ cli: name, result: "not installed" }); continue; }
+    const v0 = cliVersion(bin), row = { cli: name, before: v0, after: v0, result: "" }; rows.push(row);
+    if (p === "ollama") { row.result = `updates itself: the Ollama app does it (or ${pkgUpgrade(bin) || "rerun its installer"}); SubHub never touches it`; continue; }
+    const cmd = updaterOf(bin);
+    if (!cmd) { row.result = `no update command in its --help${pkgUpgrade(bin) ? `; try: ${pkgUpgrade(bin)}` : ""}`; continue; }
+    if (busy[p] && !force) { row.result = `skipped: jobs running on ${busy[p].join(", ")} (an update could stop them). Wait for them (subhub jobs), or use --force`; continue; }
+    if (dry) { row.result = `would run: ${name} ${cmd}`; continue; }
+    console.log(`Updating ${name} (${v0 || "version unknown"})…`);
+    const r = run(bin, [cmd], { timeout: 300000 }), out = (r.out + r.err).replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").trim();
+    row.after = cliVersion(bin); row.ran = true;
+    fs.rmSync(path.join(CACHE, `help-${p}.json`), { force: true });   // re-read its flags: a launcher script's stats needn't change when the CLI does
+    if (r.code !== 0) { const pm = /package manager|npm|brew|homebrew|winget|permission|EACCES/i.test(out) && pkgUpgrade(bin); row.result = `update failed (exit ${r.code}): ${clip(out.split("\n").pop(), 140)}${pm ? `; update it with: ${pm}` : ""}`; row.failed = true; }
+    else row.result = !v0 || !row.after ? "ran; version unknown" : row.after !== v0 ? "updated" : "already up to date";
+  }
+  for (const r of rows) console.log(`${r.cli.padEnd(13)} ${r.before === undefined ? "" : `${r.before || "?"}${r.after && r.after !== r.before ? ` → ${r.after}` : ""}`.padEnd(30)} ${r.result}`);
+  if (dry) { console.log("\nDry run: nothing was updated."); return; }
+  console.log("\nRefreshing model lists…");
+  for (const m of await refreshModels()) if (m.count || m.added.length || m.removed.length) console.log(`  ${m.provider.padEnd(7)} ${m.count} model${m.count === 1 ? "" : "s"}${m.added.length ? `; new: ${m.added.join(", ")}` : ""}${m.removed.length ? `; gone: ${m.removed.join(", ")}` : ""}`);
+  console.log("  claude  aliases (fable, opus, sonnet, haiku) always run the newest model; `subhub models claude-…` shows what each last ran as");
+  await refresh();
+  console.log(`\nSubHub itself (${VERSION}) updates with its installer: sh install.sh from your copy, or the one-line installer in the README.`);
+  if (rows.some((r) => r.failed)) process.exitCode = 1;
+}
+
 // ---------------------------------------------------------------- list / models / status
 async function cmdList(force) {
   if (force) await checkSubs();   // --refresh: also re-tests every sub (free checks, then a tiny test prompt where needed)
@@ -521,7 +850,8 @@ async function cmdList(force) {
   out.push("# Your subs (from SubHub)", "", "Run one with `subhub ask <sub> <model|default>` and the brief (see the subhub skill). Never pick the account you are running as.", "",
     "| Sub | Account | Use it for | Can do, and limits |", "|---|---|---|---|");
   const ready = [], off = [], waiting = [], stale = [];
-  for (const s of ranked(reg)) {
+  const order = cfg().order || [], pos = (s) => (order.includes(s.name) ? order.indexOf(s.name) : order.length);
+  for (const s of ranked(reg).sort((a, b) => pos(a) - pos(b) || usageRank(a, b, now))) {
     if (!isOn(s.name)) { off.push(s.name); continue; }
     if (s.state === "signedout") { waiting.push(`${s.name} (signed out)`); continue; }
     if (s.state.startsWith("changed:")) { waiting.push(`${s.name} (signed in as ${s.state.slice(8)}, not ${s.email})`); continue; }
@@ -544,6 +874,7 @@ async function cmdList(force) {
   if (firstClaude) out.push("", `**Every Claude sub** (${ready.filter((s) => s.provider === "claude").map((s) => s.name).join(", ")})`, ...models(firstClaude, true));
   if (off.length) out.push("", `Turned off by the user, don't use: ${off.join(", ")}`);
   if (waiting.length) out.push("", `Not ready, don't use: ${waiting.join(", ")}. The user fixes sign-ins with \`subhub status\` and re-tests subs with \`subhub check\`.`);
+  out.push(...planLines(reg, ready, now));
   console.log(out.join("\n"));
 }
 async function cmdModels(name) {
@@ -574,9 +905,12 @@ async function cmdStatus(args) {
   const reg = await fresh(args.includes("--refresh"));
   const agents = AGENTS.map((a) => ({ id: a, name: AGENT_NAME[a], installed: !!binFor(a), connected: agentOn(a), rules: !!rulesIn(a), rulesFile: rulesIn(a) || RULE_FILES[a]()[0] || null }));
   const f = found(reg), h = hookCfg(), hook = { on: h.on, types: h.types, loaded: claudePlugin() }, eng = engines();
+  const now = Date.now(), host = reg.subs.find((s) => isCaller(s)), tap = statusTapState();
   if (args.includes("--json")) {
-    console.log(JSON.stringify({ version: VERSION, engine: eng, subs: reg.subs.map((s) => { const hh = healthOf(s); return { name: s.name, provider: s.provider, folder: s.dir, email: s.email, label: s.label, state: s.state, on: isOn(s.name),
-      health: { state: hh.state, reason: hh.reason || "", checked: hh.checked || null, resets: hh.resets || null, via: s.health?.via || null, usable: usable(hh) } }; }), agents, hook, found: f }));
+    console.log(JSON.stringify({ version: VERSION, engine: eng, subs: reg.subs.map((s) => { const hh = healthOf(s), u = usageOf(s.name, now); return { name: s.name, provider: s.provider, folder: s.dir, email: s.email, label: s.label, state: s.state, on: isOn(s.name),
+      health: { state: hh.state, reason: hh.reason || "", checked: hh.checked || null, resets: hh.resets || null, via: s.health?.via || null, usable: usable(hh) },
+      usage: u ? { windows: u.wins.map((w) => ({ id: w.id, label: w.label, group: w.group, used: w.used, resets: w.resets })), left: u.left, seen: u.seen || null, via: u.via || null, text: usageText(u, now) } : null }; }),
+      agents, hook, found: f, advice: hostAdvice(host, now), statusline: tap }));
     return;
   }
   for (const w of eng.drift) console.log(`Warning: ${w}`);
@@ -584,7 +918,9 @@ async function cmdStatus(args) {
   for (const s of reg.subs) {
     const hh = healthOf(s), seen = hh.checked ? ` (seen ${ago(Date.now() - hh.checked)} ago)` : "";
     console.log(`  ${s.name.padEnd(10)} ${s.email.padEnd(28)} ${s.label.padEnd(26)} ${isOn(s.name) ? s.state : "off"}${s.state === "ok" ? `, ${hh.state === "unknown" && !hh.reason ? "not checked yet" : healthLine(hh) + seen}` : ""}`);
+    const u = usageOf(s.name, now); if (u?.wins.length) console.log(`  ${"".padEnd(10)} usage: ${usageText(u, now)}`);
   }
+  console.log(`Usage from Claude Code's status line: ${tap.on.length ? `on in ${tap.on.join(", ")}` : "off"}${tap.off.length ? `; not in ${tap.off.join(", ")} (subhub connect claude)` : ""}`);
   console.log("Agents:"); for (const a of agents) console.log(`  ${a.name.padEnd(12)} ${!a.installed ? "not installed" : a.connected ? "connected" : `not connected (subhub connect ${a.id})`}${a.rules ? `, always-on rule in ${a.rulesFile}` : ""}`);
   console.log(`Claude Code redirect hook: ${hook.on ? "on" : "off"} (${hook.types.map((t) => t || "no type").join(", ") || "no types"} → ${RELAY}; "hook": false in ${CFG} or SUBHUB_HOOK=0 turns it off)${hook.loaded ? "" : ". The relay agent and the hook load only with the plugin installed through Claude Code's plugin manager, which it isn't"}`);
   if (f.length) { console.log("Found, not signed in (subhub signin claude --new --email <email>):"); for (const x of f) console.log(`  ${x.email} · ${["team", "enterprise"].includes(x.type) ? "Team " + x.orgName : "Personal"}`); }
@@ -817,7 +1153,7 @@ const PARSE = {
   claude(e, r) {
     if (e.session_id) r.session ||= e.session_id;
     const sub = e.parent_tool_use_id ? "(subagent) " : "";
-    if (e.type === "system" && e.subtype === "init") r.log(`started${e.model ? " on " + e.model : ""}`);
+    if (e.type === "system" && e.subtype === "init") { r.log(`started${e.model ? " on " + e.model : ""}`); if (e.model) r.ranOn = e.model; }
     else if (e.type === "system" && e.subtype === "api_retry") r.log(`API retry ${e.attempt}/${e.max_retries}: ${e.error}`);
     else if (e.type === "assistant") for (const b of e.message?.content || []) {
       if (b.type === "text" && b.text?.trim()) { if (!sub) r.text = b.text; r.log(`${sub}says: ${clip(b.text)}`); }
@@ -825,8 +1161,15 @@ const PARSE = {
     }
     else if (e.type === "user") { for (const b of Array.isArray(e.message?.content) ? e.message.content : []) if (b.type === "tool_result" && b.is_error) r.log(`${sub}tool error: ${clip(typeof b.content === "string" ? b.content : JSON.stringify(b.content))}`); }
     else if (e.type === "result") { r.answer = e.result ?? r.text; r.error = !!e.is_error; r.log(`finished: ${e.subtype || (e.is_error ? "error" : "success")}`); }
+    else if (e.type === "rate_limit_event") {
+      const info = e.rate_limit_info || {}, w = claudeWindows(info); if (!w.length) return;
+      r.usage = w; const f = w.find((x) => x.id === "5h"); if (f) { r.five0 ||= f; r.five1 = f; }
+      r.overage = !!info.isUsingOverage;
+      if (info.status === "rejected") r.rejected = { label: { five_hour: "5h", seven_day: "7d" }[info.rateLimitType] || String(info.rateLimitType || "usage").replace(/_/g, " "), resets: info.resetsAt ? info.resetsAt * 1000 : null };
+    }
   },
   codex(e, r) {
+    const rl = findRateLimits(e); if (rl) { const w = codexWindows([rl]); if (w.length) r.usage = w; }
     if (e.type === "thread.started") { r.session ||= e.thread_id; r.log("started"); }
     else if (e.type === "item.started" || e.type === "item.completed") {
       const it = e.item || {}, done = e.type === "item.completed";
@@ -937,6 +1280,17 @@ async function execJob(id) {
   fs.writeFileSync(jf(id, "answer.txt"), answer); if (changes) fs.writeFileSync(jf(id, "changes.txt"), changes);
   const fin = jset(id, { state: why === "timeout" ? "timeout" : why || (code === 0 ? "done" : "failed"), code, ended: Date.now(), active, session: r.session || j.session || null, child: null });
   learn(fin);   // passive learning: every real ask updates the sub's health, for free
+  try {   // usage and reset times, free: from the run's own events, or Antigravity's /quota
+    if (r.usage) noteUsage(j.sub, r.usage, "ask");
+    if (j.provider === "claude" && r.ranOn) {   // what each alias (opus, sonnet…) resolves to now, shown in the model list
+      const f = path.join(CACHE, "claude-aliases.json"), m = readJSON(f) || {}, k = String(j.model).replace(/^'|'$/g, "");
+      if (m[k]?.model !== r.ranOn) { m[k] = { model: r.ranOn, seen: Date.now() }; writeJSON(f, m); }
+    }
+    if (!j.probe) learnCost(j.sub, r.five0, r.five1);
+    if (r.rejected) setHealth(j.sub, { state: "limit", reason: `${r.rejected.label} limit used up`, resets: r.rejected.resets }, "ask");
+    else if (r.usage && j.provider === "claude" && !r.overage) limitFromUsage(j.sub, r.usage, "ask");
+    if (j.provider === "gemini") { const s = loadReg().subs.find((x) => x.name === j.sub), w = s && await agyQuota(s); if (w) { noteUsage(j.sub, w, "quota"); limitFromUsage(j.sub, w, "quota"); } }
+  } catch {}
   return fin;
 }
 
@@ -967,13 +1321,18 @@ async function cmdJob(args) {
     result();
   } else {
     if (j.state !== "running") { console.log(`Job ${id} isn't running (${j.state}).`); return; }
-    fs.writeFileSync(jf(id, "stop"), String(Date.now()));
-    if (j.child) killTree(j.child);
-    for (let i = 0; i < 40 && j.state === "running"; i++) { await sleep(250); j = jget(id); }
-    if (j.state === "running") { killTree(j.child, "SIGKILL"); killTree(j.pid, "SIGKILL"); j = jset(id, { state: "stopped", code: 13, ended: Date.now(), child: null }); }
-    const w = whyNot(j);
-    console.log(`Stopped job ${id}. ${w ? `It can't be continued: ${w}.` : `Continue it: subhub ask --continue ${id} "<what to do next>"`}`);
+    console.log(await stopJob(j));
   }
+}
+/** Stops a running job (its whole process tree) and says how to continue it. */
+async function stopJob(j) {
+  const id = j.id;
+  fs.writeFileSync(jf(id, "stop"), String(Date.now()));
+  if (j.child) killTree(j.child);
+  for (let i = 0; i < 40 && j.state === "running"; i++) { await sleep(250); j = jget(id); }
+  if (j.state === "running") { killTree(j.child, "SIGKILL"); killTree(j.pid, "SIGKILL"); j = jset(id, { state: "stopped", code: 13, ended: Date.now(), child: null }); }
+  const w = whyNot(j);
+  return `Stopped job ${id}. ${w ? `It can't be continued: ${w}.` : `Continue it: subhub ask --continue ${id} "<what to do next>"`}`;
 }
 
 // ---------------------------------------------------------------- Ollama: its HTTP API, every feature the model reports
@@ -1125,6 +1484,7 @@ const RULE_BLOCK = [`${RULE_START} v${VERSION}: written by SubHub, removed by su
   "## Use the user's other AI subscriptions (SubHub) first",
   "- Before starting a built-in sub-agent, or doing delegable side work (wide file reads, research, reviews, independent edits, parallel pieces), hand the work to a ready sub with `subhub ask` (details in the subhub skill). This saves this account's usage. Run `subhub list` once per task, not before every step.",
   "- Do it yourself or with built-in sub-agents only when `subhub list` shows no ready sub, the task is a few tool calls, the work needs this conversation's context that can't be put in a brief, or the brief would have to contain secrets.",
+  "- Plan with the \"Usage and plan\" part of `subhub list` (or `subhub usage`): it shows every account's limit windows and reset times, including your own. Spread independent pieces across subs in parallel up to each sub's free slots, use subs whose headroom resets soonest first, and follow its advice for your own account: near its limit, delegate everything; resetting soon with room left, use it now. Aim to keep every ready sub fully used.",
   "- If a sub fails, stalls or reports a usage limit, try one other sub once, then do the work yourself. Never retry the same sub in a loop.",
   "- If you are running as a sub yourself (the brief says you are a sub-agent, or SUBHUB_DEPTH is set), don't delegate.",
   "- Run `subhub` as the whole command, with nothing chained before or after it.",
@@ -1184,6 +1544,7 @@ function connect(a, rules = !process.env.SUBHUB_NO_RULES) {
     if (!agentOn("claude")) copyDir(SRC, path.join(HOME, ".claude", "skills", "subhub"));
     const f = path.join(HOME, ".claude", "settings.json");
     for (const r of RULES()) allow(true, f, `Bash(${r} *)`); allow(true, f, "Skill(subhub:subhub)");
+    if (!tapOff() && !process.argv.includes("--no-statusline")) statusTap(true);
   } else if (a === "codex") {
     quiet(b, ["plugin", "remove", "subhub"]); quiet(b, ["plugin", "marketplace", "remove", "subhub"]); quiet(b, ["plugin", "marketplace", "add", market]);
     if (!quiet(b, ["plugin", "add", "subhub@subhub"])) copyDir(path.join(SRC, "skills", "subhub"), SKILL_DIR.codex());
@@ -1209,6 +1570,7 @@ function disconnect(a) {
     if (b) { quiet(b, ["plugin", "uninstall", "subhub@subhub"]); quiet(b, ["plugin", "marketplace", "remove", "subhub"]); }
     if (pexist(path.join(HOME, ".claude", "skills", "subhub", "bin", "subhub.mjs"))) fs.rmSync(path.join(HOME, ".claude", "skills", "subhub"), { recursive: true, force: true });
     const f = path.join(HOME, ".claude", "settings.json"); for (const r of RULES()) allow(false, f, `Bash(${r} *)`); allow(false, f, "Skill(subhub:subhub)");
+    statusTap(false);
   } else if (a === "codex") {
     if (b) { quiet(b, ["plugin", "remove", "subhub"]); quiet(b, ["plugin", "marketplace", "remove", "subhub"]); }
     fs.rmSync(SKILL_DIR.codex(), { recursive: true, force: true }); fs.rmSync(path.join(codexHome(), "rules", "subhub.rules"), { force: true });
@@ -1290,10 +1652,14 @@ function cmdRemove(name) {
   fs.appendFileSync(IGN, `${s.provider}:${s.dir}\n`); reg.subs = reg.subs.filter((x) => x !== s); saveReg(reg);
   console.log(`Removed ${name}. Its sign-in stays; SubHub won't add it back. Undo: delete that line from ${IGN}.`);
 }
-function cmdOnOff(on, name) {
+async function cmdOnOff(on, name) {
   if (!loadReg().subs.some((x) => x.name === name)) die(2, `unknown sub '${name}'.`);
   const c = cfg(); c.subs ||= {}; c.subs[name] ||= {}; c.subs[name].on = on; c.order ||= []; writeJSON(CFG, c);
   console.log(`${name} is ${on ? "on" : "off"}.`);
+  if (on) return;
+  // off means off: nothing of this sub keeps running. A stopped job can be continued once the sub is on again.
+  const running = ls(JOBS).map(jload).filter((j) => j && j.sub === name && j.state === "running");
+  for (const m of await Promise.all(running.map(stopJob))) console.log(m);
 }
 
 // ---------------------------------------------------------------- engine copies: `subhub` on PATH (~/.subhub/bin) and the plugin copies agents load
@@ -1347,6 +1713,7 @@ function cmdHook(args) {
     if (versionIn(path.join(BIN, "subhub.mjs")) !== VERSION) return;   // `subhub` on PATH is missing or another version: the relay couldn't work
     const subs = readJSON(REG)?.subs; if (!Array.isArray(subs)) return;
     if (!subs.some((s) => s && c.subs?.[s.name]?.on !== false && s.state === "ok" && usable(healthOf(s)) && !isCaller(s, process.env, true))) return;
+    if (hostAdvice(subs.find((s) => s && isCaller(s, process.env, true))).mode === "spend") return;   // own window resets soon with room left: use it
     const key = crypto.createHash("sha1").update(`${inp.session_id || ""}\0${typeof ti.prompt === "string" ? ti.prompt : JSON.stringify(ti.prompt ?? "")}`).digest("hex");
     const now = Date.now(), old = readJSON(HOOK_STATE), st = {};
     for (const [k, t] of Object.entries(old && typeof old === "object" ? old : {})) if (typeof t === "number" && now - t < 86400000) st[k] = t;   // a day
@@ -1373,11 +1740,14 @@ switch (cmd) {
   case "refresh": await refresh(); console.log("Refreshed."); break;
   case "install": await cmdInstall(withRules, !flags.includes("--no-check") && !process.env.SUBHUB_NO_CHECK); break;
   case "check": await cmdCheck(rest); break;
+  case "usage": await cmdUsage(rest); break;
+  case "update": await cmdUpdate(rest); break;
+  case "statusline": await cmdStatusline(); break;
   case "connect": for (const a of target(words[0])) connect(a, withRules); break;
   case "disconnect": for (const a of target(words[0])) disconnect(a); break;
   case "signin": await cmdSignin(rest); break;
   case "remove": cmdRemove(rest[0]); break;
-  case "on": case "off": cmdOnOff(cmd === "on", rest[0]); break;
+  case "on": case "off": await cmdOnOff(cmd === "on", rest[0]); break;
   case "config": console.log(`${CFG}:\n` + (pexist(CFG) ? fs.readFileSync(CFG, "utf8") : '(none yet: {"subs":{"<sub>":{"on":true,"use_for":"","model":"default","notes":""}},"order":[],"notes":"","hook":true})')); break;
   case "ollama": await cmdOllama(rest); break;
   case "hook": cmdHook(rest); break;

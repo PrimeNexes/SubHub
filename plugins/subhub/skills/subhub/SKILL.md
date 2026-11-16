@@ -22,7 +22,16 @@ Heredocs work in bash and zsh (Claude Code uses bash on Windows too). Where ther
 To run in another folder (a git worktree you made for it): `subhub ask --in <folder> <sub> <model> <<'SUBHUB_BRIEF_END'`. All models of one sub: `subhub models <sub>`.
 
 ## Choosing
-- Match the task to "Use it for" and check "Can do, and limits". When several fit, prefer the one listed first.
+- Match the task to "Use it for" and check "Can do, and limits". When several fit, prefer the one listed first: the table is sorted by usage (headroom that resets soonest first, then most headroom; unknown usage last).
+
+## Usage, resets and planning: use every sub fully
+`subhub list` ends with "Usage and plan"; `subhub usage` shows the same, fresher (it re-reads Codex and Antigravity limits, free, no prompt). For every account, yours included: each limit window (5h, weekly, per model group), % used, reset time, jobs running, and free parallel slots.
+- Plan before a big task: split it into independent pieces and spread them across subs in parallel (`subhub ask --bg`), up to each sub's free slots. Free slots come from what one job has cost that account before, or from its headroom.
+- Use headroom before it's lost: a sub listed under "Use first" has lots unused that resets within 2 hours. Give it work now.
+- Your own account: follow its line. Near its limit (85%+ of 5h, or 90%+ of the week): delegate everything delegable and keep your own turns short until it resets. Resetting within about 75 minutes with 40%+ left: that headroom is lost at the reset, so use it now; your built-in sub-agents are fine then (the SubHub hook lets them through), and subs still take extra parallel work.
+- Over 85% of a window: one small job at most on that sub. A window at 100% puts the sub under "Not ready" until it resets.
+- A per-model-group limit (for example Antigravity's "Claude/GPT 7d") only blocks that group's models on that sub: pick a model from another group.
+- Cursor and Ollama don't report usage: treat them as unknown, after subs with known headroom.
 - If a sub fails, stalls or reports a usage limit, try one other sub once, then do the work yourself (or with a built-in sub-agent). Never retry the same sub, and never loop through subs. After a limit or credits error (or exit 9), don't use that sub again in this task: SubHub has recorded it and lists it as not ready until its reset time.
 - `subhub check` re-tests which subs actually work (it sends each a tiny test prompt, which uses a little of its usage). It's for the user; run it only when the user asks. (A timeout or stall of a job that got somewhere can instead be continued once with `--continue`.)
 - In Claude Code with the SubHub plugin, the simplest way to delegate is the Agent tool with subagent_type `subhub:relay`: it runs these steps on a cheap model and returns the sub's answer and job id. Optional first line of its prompt: `use: <sub> [model]`, or `continue: <job id>` for a follow-up.

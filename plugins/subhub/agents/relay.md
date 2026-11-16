@@ -21,7 +21,7 @@ The task is the brief. Copy it exactly, character for character. SubHub tells th
 
 ## 2. Pick a sub (only when none was named)
 
-Run `subhub list` once. Take the first ready sub in the table whose "Use it for" and "Can do, and limits" fit the task. Never use a sub listed under "Not ready" (at its usage limit, out of credits, not authorised, failing) or "Turned off". Use model `default` unless the list says the task needs another (for example a huge input needs a big-context model). If the table has no ready sub, stop and return the failure line from step 5 with `no ready sub`.
+Run `subhub list` once. The table is sorted by usage: subs whose unused headroom resets soonest come first, then the most headroom. Take the first ready sub in the table that has a free slot in "Usage and plan" and whose "Use it for" and "Can do, and limits" fit the task. Never use a sub listed under "Not ready" (at its usage limit, out of credits, not authorised, failing) or "Turned off". Use model `default` unless the list says the task needs another (for example a huge input needs a big-context model). If the table has no ready sub, stop and return the failure line from step 5 with `no ready sub`.
 
 ## 3a. Start the job
 

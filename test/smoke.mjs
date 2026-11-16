@@ -42,7 +42,11 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // --help: each CLI's documented stream and resume flags (STANDIN_OLD: an older CLI without them)
 const HELP = { claude: "--output-format <format> text, json or stream-json\\n--resume [value]", codex: "Commands:\\n  resume\\n--json  Print events to stdout as JSONL",
   "cursor-agent": "--output-format <format> text | json | stream-json\\n--resume [chatId]", agy: "--conversation  Resume\\n--output-format (text, json, stream-json)\\n--settings" };
-if (a.includes("--help")) { if (!process.env.STANDIN_OLD) console.log(HELP[tool]); process.exit(0); }
+if (a.includes("--help")) { if (!process.env.STANDIN_OLD) console.log(HELP[tool] + "\\nCommands:\\n  update          Update to the latest version"); process.exit(0); }
+// --version and update: update logs the call, bumps the version, and (agy) adds a model
+const VERF = path.join(home, ".standin", "version-" + tool);
+if (a[0] === "--version") { console.log(\`\${tool} \${fs.existsSync(VERF) ? fs.readFileSync(VERF, "utf8").trim() : "1.0.0"}\`); process.exit(0); }
+if (a[0] === "update") { fs.mkdirSync(path.dirname(VERF), { recursive: true }); fs.appendFileSync(path.join(home, ".standin", "calls.log"), tool + " update\\n"); fs.writeFileSync(VERF, "1.1.0"); console.log("Updated to 1.1.0"); process.exit(0); }
 // health modes (working, limit, credits, noauth, garbage): <CLAUDE_CONFIG_DIR or ~/.claude>/standin-mode for claude, ~/.standin/<tool> for the rest
 const modeOf = (f) => { try { return fs.readFileSync(f, "utf8").trim(); } catch { return ""; } };
 const mode = modeOf(tool === "claude" ? path.join(process.env.CLAUDE_CONFIG_DIR || path.join(home, ".claude"), "standin-mode") : path.join(home, ".standin", tool));
@@ -71,7 +75,14 @@ if (tool === "claude") {
   if (a[0] === "status") { console.log("Logged in as cur@x.com\\nTeam: Acme Team (id 1)"); process.exit(0); }
   if (a[0] === "--list-models") { console.log("Available models\\n\\nauto - Auto (default)\\ngpt-5.3-codex-high - Codex 5.3 High\\nclaude-opus-5-thinking-high - Claude Opus 5 1M Thinking"); process.exit(0); }
 } else if (tool === "agy") {
-  if (a[0] === "models") { console.log("gemini-3.8-flash-high\\tGemini 3.8 Flash (High)\\ngemini-3.8-flash-low\\tGemini 3.8 Flash (Low)"); process.exit(0); }
+  if (a[0] === "models") { console.log("gemini-3.8-flash-high\\tGemini 3.8 Flash (High)\\ngemini-3.8-flash-low\\tGemini 3.8 Flash (Low)" + (fs.existsSync(VERF) ? "\\ngemini-4-pro\\tGemini 4 Pro" : "")); process.exit(0); }
+  if (a.includes("/quota")) {   // agy -p /quota --output-format json: no turn, no tokens
+    logCall("agy quota"); const at = (h) => new Date(Date.now() + h * 3600000).toISOString().replace(/\\.\\d+Z$/, "Z");
+    j({ conversation_id: "", status: "SUCCESS", response: "", command: { name: "usage", data: { groups: [
+      { name: "Gemini Models", buckets: [{ id: "gemini-weekly", window: "weekly", remaining_fraction: 0.9, reset_time: at(100) }, { id: "gemini-5h", window: "5h", remaining_fraction: mode === "quota0" ? 0 : 0.6, reset_time: at(1) }] },
+      { name: "Claude and GPT models", buckets: [{ id: "3p-weekly", window: "weekly", remaining_fraction: 0, reset_time: at(50) }, { id: "3p-5h", window: "5h", disabled: true }] }] } } });
+    process.exit(0);
+  }
   if (a[0] === "plugin") process.exit(1);
 }
 // a sub run: the brief is the last argument, or stdin (Windows shims: claude, and codex with "-")
@@ -82,9 +93,11 @@ const resumed = tool === "codex" ? (a[1] === "resume" ? a[a.length - 2] : "") : 
 const stream = tool === "codex" ? a.includes("--json") : val("--output-format") === "stream-json";
 const sid = resumed || tool + "-sess-" + process.pid;
 let n = 0;
+const RESET = Math.floor(Date.now() / 1000) + 7200, rl = (u) => j({ type: "rate_limit_event", session_id: sid, rate_limit_info: { status: "allowed", resetsAt: RESET, rateLimitType: "five_hour", utilization: u,
+  unifiedWindows: { five_hour: { utilization: u, resetsAt: RESET, status: "allowed" }, seven_day: { utilization: 0.05, resetsAt: RESET + 400000, status: "allowed" } } } });
 const E = {
-  claude: { start: () => j({ type: "system", subtype: "init", session_id: sid, model: "m" }), tool: (x) => j({ type: "assistant", session_id: sid, parent_tool_use_id: null, message: { content: [{ type: "tool_use", name: "Bash", input: { command: x } }] } }),
-    end: (t) => j({ type: "result", subtype: "success", is_error: false, result: t, session_id: sid }) },
+  claude: { start: () => { j({ type: "system", subtype: "init", session_id: sid, model: "m" }); rl(0.2); }, tool: (x) => j({ type: "assistant", session_id: sid, parent_tool_use_id: null, message: { content: [{ type: "tool_use", name: "Bash", input: { command: x } }] } }),
+    end: (t) => { rl(0.26); j({ type: "result", subtype: "success", is_error: false, result: t, session_id: sid }); } },
   codex: { start: () => j({ type: "thread.started", thread_id: sid }), tool: (x) => j({ type: "item.started", item: { id: "i" + ++n, type: "command_execution", command: x, status: "in_progress" } }),
     end: (t) => { j({ type: "item.completed", item: { id: "m", type: "agent_message", text: t } }); j({ type: "turn.completed", usage: {} }); } },
   "cursor-agent": { start: () => j({ type: "system", subtype: "init", session_id: sid, model: "m" }), tool: (x) => j({ type: "tool_call", subtype: "started", call_id: "c" + ++n, tool_call: { shellToolCall: { args: { command: x } } }, session_id: sid }),
@@ -98,13 +111,14 @@ const out = stream && !brief.includes("NOSTREAM") ? E[tool] : plain;
 logCall(tool + " run" + (tool === "claude" ? " " + (process.env.CLAUDE_CONFIG_DIR || "-") : ""));
 // each CLI's own wording (from its docs and issue trackers) for a limit, used-up credits, and a headless auth failure
 const MSG = {
-  limit: { claude: "You've hit your limit · resets 9:40pm (UTC)", codex: "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro) or try again in 2 hours 5 minutes.",
+  limit: { claude: "You've hit your 5-hour limit · resets 9:40pm (UTC)", codex: "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro) or try again in 2 hours 5 minutes.",
     "cursor-agent": "Error: You've hit your usage limit for this model. Try again in 3 hours.", agy: "RESOURCE_EXHAUSTED (429): You have exhausted your capacity on this model. Your quota will reset after 2h30m." },
   credits: { claude: "Credit balance is too low", codex: "Quota exceeded. Check your plan and billing details.", "cursor-agent": "You're out of usage. Upgrade to Pro to keep going.", agy: "This model requires a paid plan: no active subscription" },
   noauth: { claude: "Not logged in · Please run /login", codex: "401 Unauthorized: Your access token could not be refreshed.", "cursor-agent": "Error: Authentication required. Please run 'agent login' first, or set CURSOR_API_KEY.", agy: "UNAUTHENTICATED: not signed in" },
   role: { "cursor-agent": "ActionRequiredError: Change your role to use agents Your role does not have access to agents. Please ask your team admin to upgrade your role to use agents." },
 };
-if (mode === "garbage") { console.log("%%%% ?? <<<>>> 0xdeadbeef"); process.stderr.write("panic: core dumped at 0xdeadbeef\\n"); process.exitCode = 3; }
+if (mode === "limitquiet") { E.claude.start(); j({ type: "rate_limit_event", session_id: sid, rate_limit_info: { status: "rejected", resetsAt: RESET, rateLimitType: "five_hour", utilization: 1.1, unifiedWindows: { five_hour: { utilization: 1.1, resetsAt: RESET } } } }); j({ type: "result", subtype: "success", is_error: false, result: "Sorry, I can't do that right now.", session_id: sid }); }
+else if (mode === "garbage") { console.log("%%%% ?? <<<>>> 0xdeadbeef"); process.stderr.write("panic: core dumped at 0xdeadbeef\\n"); process.exitCode = 3; }
 else if (MSG[mode]) {
   const msg = MSG[mode][tool];
   if (stream && tool === "claude") { E.claude.start(); j({ type: "result", subtype: "success", is_error: true, result: msg, session_id: sid }); }
@@ -276,6 +290,11 @@ ok(list.some((x) => x.id === id && x.state === "done" && x.continuable === true)
 r = await sh(["ask", "--bg", "--in", JW, "gemini-1", "default", "x\nSLEEP"]); id = jobOf(r);
 r = await sh(["job", "wait", id, "1"]); ok(r.code === 14 && /running/.test(r.out), "job wait gives up after its seconds (exit 14)", `${r.code} ${r.out}`);
 await sh(["job", "stop", id]);
+r = await sh(["ask", "--bg", "--in", JW, "gemini-1", "default", "x\nSLEEP"]); id = jobOf(r); await pause(800);
+r = await sh(["off", "gemini-1"]); m = meta(id);
+ok(r.code === 0 && r.out.includes(`Stopped job ${id}`) && m.state === "stopped" && m.code === 13, "off stops that sub's running jobs", r.out + JSON.stringify(m));
+r = await sh(["ask", "--continue", id, "more"]); ok(r.code === 8, "an off sub's stopped job can't be continued until it is on again", `${r.code} ${r.err}`);
+await sh(["on", "gemini-1"]);
 // stalls: silent, and a repeating "waiting for background task" line
 r = await sh(["ask", "--in", JW, "gemini-1", "default", "x\nSLEEP"], { env: { SUBHUB_IDLE: "2" } }); id = jobOf(r);
 ok(r.code === 12 && meta(id).state === "stalled" && /stalled/.test(r.err) && /--continue/.test(r.err), "a silent sub is stopped as stalled (exit 12), continuable", `${r.code} ${r.err}`);
@@ -323,7 +342,7 @@ const row = Object.fromEntries((ck.subs || []).map((x) => [x.name, x])), newCall
 console.log(`      check of ${ck.subs?.length} subs took ${tCheck} ms`);
 ok(Array.isArray(ck.subs) && ck.subs.length === Object.keys(regH()).length && ck.subs.every((x) => ["name", "provider", "account", "result", "reason", "resets", "how"].every((k) => k in x)), "check --json: a row per sub with name, provider, account, result, reason, resets, how", r.out + r.err);
 ok(row["claude-1"]?.result === "you" && /this is you/.test(row["claude-1"].reason) && !newCalls.includes("claude run -") && !regH()["claude-1"].health, "check: the caller's own account is not probed", JSON.stringify([row["claude-1"], newCalls]));
-ok(row[claude2]?.result === "limit" && row[claude2].resets > Date.now() && /hit your limit/.test(row[claude2].reason) && /test prompt, model haiku/.test(row[claude2].how), "check: a Claude usage-limit message is 'limit' with its reset time", JSON.stringify(row[claude2]));
+ok(row[claude2]?.result === "limit" && row[claude2].resets > Date.now() && /hit your 5-hour limit/.test(row[claude2].reason) && /test prompt, model haiku/.test(row[claude2].how), "check: a Claude usage-limit message is 'limit' with its reset time", JSON.stringify(row[claude2]));
 ok(row[teamSub]?.result === "working" && /test prompt/.test(row[teamSub].how), "check: a sub that answers the test prompt is working", JSON.stringify(row[teamSub]));
 ok(row["codex-1"]?.result === "nocredits" && /plan and billing/.test(row["codex-1"].reason) && newCalls.includes("codex app-server") && newCalls.includes("codex run"), "check: codex free check inconclusive, then its test prompt says out of credits", JSON.stringify([row["codex-1"], newCalls]));
 ok(row["cursor-1"]?.result === "noauth" && /Authentication required/.test(row["cursor-1"].reason), "check: Cursor signed in (status) but refused in a headless run is 'noauth'", JSON.stringify(row["cursor-1"]));
@@ -355,7 +374,7 @@ ok(r.code === 1 && calls().length === c0 + 1 && regH()[claude2].health.via === "
 // a passed reset time: ready again without a probe
 let regj = JSON.parse(rdf(REGF)); regj.subs.find((s) => s.name === claude2).health.resets = Date.now() - 60000; fs.writeFileSync(REGF, JSON.stringify(regj));
 c0 = calls().length; r = await sh(["list"]);
-ok(r.out.includes(`| ${claude2} |`) && !new RegExp(`${claude2} \\(`).test(r.out) && calls().length === c0, "a limit whose reset time has passed is ready again, without a probe", r.out.split("## Models")[0]);
+ok(r.out.includes(`| ${claude2} |`) && !new RegExp(`${claude2} \\(`).test(r.out.split("## Usage and plan")[0]) && calls().length === c0, "a limit whose reset time has passed is ready again, without a probe", r.out.split("## Models")[0]);
 r = await sh(["status", "--json"]); ok(JSON.parse(r.out).subs.find((s) => s.name === claude2).health.state === "unknown", "status: after the reset time the sub's health is unknown");
 // passive learning from real asks
 setMode("agy", ""); r = await sh(["ask", "gemini-1", "default", "x\nhello"]);
@@ -502,6 +521,63 @@ ok(read(CMD) === CMD0 && read(AMD) === AMD0, "disconnect restores the rules file
 ok(!fs.existsSync(GMD), "disconnect removes the rules file SubHub created");
 if (!WIN) ok(fs.lstatSync(AMD).isSymbolicLink(), "symlink still a symlink after disconnect");
 r = await sh(["status", "--json"]); ok(JSON.parse(r.out).agents.every((a) => a.rules === false), "status: no rule after disconnect");
+
+// 6b. usage and reset tracking
+const USAGEF = path.join(H, ".subhub", "usage.json"), usage = () => JSON.parse(rdf(USAGEF) || "{}");
+fs.rmSync(USAGEF, { force: true });
+r = await sh(["ask", claude2, "default", "usage run"]);
+let u2 = usage()[claude2];
+ok(r.code === 0 && u2?.windows?.["5h"]?.used === 26 && u2.windows["7d"]?.used === 5 && u2.windows["5h"].resets > Date.now() + 3600000, "Claude: a run records its 5h and 7d windows and reset times from rate_limit_event", JSON.stringify(u2));
+ok(u2?.perJob === 6, "Claude: learns how much of the 5h window one job uses", JSON.stringify(u2));
+r = await sh(["ask", "gemini-1", "default", "usage run"]); let ug = usage()["gemini-1"];
+ok(ug?.windows?.["gemini-5h"]?.used === 40 && ug.windows["3p-weekly"]?.group === "Claude/GPT" && !ug.windows["3p-5h"], "Antigravity: /quota after a run records windows per model group, skipping disabled ones", JSON.stringify(ug));
+ok(regH()["gemini-1"].health?.state !== "limit", "a used-up limit of another model group doesn't mark the sub at its limit", JSON.stringify(regH()["gemini-1"].health));
+r = await sh(["usage", "--json"]); let uj = {}; try { uj = JSON.parse(r.out); } catch {}
+const urow = (n) => (uj.subs || []).find((x) => x.name === n) || {};
+ok(urow(claude2).left === 74 && urow(claude2).freeSlots === 6 && urow("gemini-1").left === 60, "usage --json: headroom and free parallel slots per sub", r.out);
+c0 = calls().length; r = await sh(["list"]);
+ok(/## Usage and plan/.test(r.out) && new RegExp(`\\*\\*${claude2}\\*\\*: 5h 26% used, resets .* \\(in 1h 5\\dm\\)`).test(r.out) && /free slots/.test(r.out) && /Use first \(headroom expires soon\): .*gemini-1/.test(r.out) && calls().length === c0, "list: usage and plan section, soon-expiring headroom first, no CLI started", r.out.split("## Usage and plan")[1]);
+ok(r.out.indexOf(`| ${claude2} |`) > r.out.indexOf("| gemini-1 |"), "list: subs whose headroom expires soonest come first", r.out.split("## Models")[0]);
+fs.writeFileSync(MODEF.claude2, "limitquiet"); r = await sh(["check", claude2, "--json"]); let lq = {}; try { lq = JSON.parse(r.out).subs[0]; } catch {}
+ok(lq.result === "limit" && lq.resets > Date.now() && usage()[claude2].windows["5h"].used === 110, "check: a used-up window seen only in the run's rate-limit events is 'limit', not 'failing'", r.out + r.err);
+fs.writeFileSync(MODEF.claude2, ""); { const rg = JSON.parse(rdf(REGF)); delete rg.subs.find((x) => x.name === claude2).health; fs.writeFileSync(REGF, JSON.stringify(rg)); }
+// expired windows count as unused
+let uf = usage(); uf[claude2].windows["5h"].resets = Date.now() - 1000; fs.writeFileSync(USAGEF, JSON.stringify(uf));
+r = await sh(["usage"]); ok(new RegExp(`${claude2} .*5h 0% used \\(reset since\\)`).test(r.out), "a window whose reset time passed counts as unused", r.out);
+// status line tap: records the session account's limits and still prints the user's own status line
+const C2 = path.join(H, ".claude-acct2"), S2 = path.join(C2, "settings.json");
+fs.writeFileSync(S2, JSON.stringify({ statusLine: { type: "command", command: "echo MYLINE", padding: 1 } }));
+await sh(["connect", "claude"]);
+let st2 = JSON.parse(rdf(S2)); ok(/subhub\.mjs" statusline/.test(st2.statusLine.command) && st2.statusLine.padding === 1, "connect claude puts the tap in front of each Claude folder's status line", JSON.stringify(st2));
+const soon = Math.floor(Date.now() / 1000) + 1800;
+r = await sh(["statusline"], { env: { CLAUDE_CONFIG_DIR: C2 }, input: JSON.stringify({ model: {}, rate_limits: { five_hour: { used_percentage: 30, resets_at: soon }, seven_day: { used_percentage: 12.5, resets_at: soon + 500000 } } }) });
+ok(r.out.trim() === "MYLINE" && usage()[claude2].windows["5h"].used === 30 && usage()[claude2].via === "statusline", "statusline: records rate_limits for that folder's account and prints the user's own status line", r.out + JSON.stringify(usage()[claude2]));
+const asHost = { CLAUDECODE: "1", CLAUDE_CONFIG_DIR: C2 };
+r = await sh(["usage", "--json"], { env: asHost }); let adv = {}; try { adv = JSON.parse(r.out).advice; } catch {}
+ok(adv.mode === "spend" && /resets .* use it now/i.test(adv.text), "host advice: own window resets soon with room left: spend it", JSON.stringify(adv));
+r = await hook(call("general-purpose", "p-spend"), { env: asHost }); ok(quiet(r), "hook: lets built-in sub-agents run while the own account should be used up before its reset", JSON.stringify(r));
+await sh(["statusline"], { env: { CLAUDE_CONFIG_DIR: C2 }, input: JSON.stringify({ rate_limits: { five_hour: { used_percentage: 91, resets_at: soon + 3600 } } }) });
+r = await sh(["usage", "--json"], { env: asHost }); try { adv = JSON.parse(r.out).advice; } catch {}
+ok(adv.mode === "save" && /91% of its 5h limit/.test(adv.text), "host advice: own account near its limit: delegate everything", JSON.stringify(adv));
+await sh(["disconnect", "claude"]); st2 = JSON.parse(rdf(S2));
+ok(st2.statusLine?.command === "echo MYLINE" && st2.statusLine.padding === 1, "disconnect claude restores the user's own status line", JSON.stringify(st2));
+await sh(["connect", "claude", "--no-statusline"]); ok(JSON.parse(rdf(S2)).statusLine.command === "echo MYLINE", "connect --no-statusline leaves the status line alone");
+await sh(["disconnect", "claude"]);
+
+// 6c. update: the agent CLIs' own update commands, then model lists; only on subhub update
+r = await sh(["update", "--dry-run"]);
+ok(r.code === 0 && /claude .*would run: claude update/.test(r.out) && /agy .*would run: agy update/.test(r.out) && /cursor-agent .*would run: cursor-agent update/.test(r.out) && !calls().some((c) => / update$/.test(c)), "update --dry-run shows each CLI's updater and runs none", r.out);
+r = await sh(["ask", "--bg", "--in", WORK, "gemini-1", "default", "x\nSLEEP"]); const upJob = jobOf(r); await pause(500);
+r = await sh(["update", "agy"]); ok(/agy .*skipped: jobs running on gemini-1/.test(r.out) && !calls().includes("agy update"), "update skips a CLI with running jobs", r.out);
+await sh(["job", "stop", upJob]);
+r = await sh(["update", "codex"], { env: { STANDIN_OLD: "1" } }); ok(r.code === 0 && /codex .*no update command/.test(r.out), "update: a CLI without an update command is reported, not run", r.out);
+r = await sh(["update"]);
+ok(r.code === 0 && ["claude update", "codex update", "agy update", "cursor-agent update"].every((c) => calls().includes(c)) && /claude +1\.0\.0 → 1\.1\.0 +updated/.test(r.out), "update runs every CLI's updater and shows old → new version", r.out);
+ok(/gemini +3 models; new: gemini-4-pro/.test(r.out), "update re-reads model lists and names new models", r.out);
+ok(["claude", "codex", "gemini", "cursor"].every((p) => !fs.existsSync(path.join(H, ".subhub", "cache", `help-${p}.json`))), "update drops each updated CLI's cached --help flags");
+r = await sh(["models", "gemini-1"]); ok(r.out.includes("gemini-4-pro"), "the new model is offered right away");
+r = await sh(["models", claude2]); ok(/`opus`: .*\(last ran as m\)/.test(r.out), "Claude models show what each alias last ran as", r.out);
+c0 = calls().length; await sh(["list"]); await sh(["status"]); ok(!calls().slice(c0).some((c) => / update$/.test(c)), "list and status never update anything");
 
 // 7. install and remove
 r = await sh(["install"], { env: { SUBHUB_REPO: ROOT } });

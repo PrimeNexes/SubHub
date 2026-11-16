@@ -80,6 +80,8 @@ Or install the plugin through each agent's own plugin manager:
 
 Then run `node <plugin folder>/bin/subhub.mjs install` once. It adds the permission rules and finds your accounts.
 
+**macOS app (optional):** `SubHub.app` is a window onto the same `subhub` engine: on/off switches for subs and agents, each sub's health (at its limit, out of credits, failing, and why), sign-ins (they open in Terminal) and a "Test Which Subs Work" button. It follows changes made from the command line within a few seconds. It carries a copy of the plugin for first-time install, and never installs an older copy over a newer one. Build it with `xcodebuild -project SubHub.xcodeproj -scheme SubHub -configuration Release -derivedDataPath build clean build`.
+
 ## Use it
 
 Ask any connected agent in plain words:
@@ -124,6 +126,32 @@ Every `subhub ask` is a job with a short id, kept in `~/.subhub/jobs/<id>/` for 
 SubHub checks each CLI's `--help` for these flags; a CLI without them, or a stream it can't read, runs in plain mode as before (stdout is the answer, stderr lines are the progress). A job can be continued after it finishes, times out, stalls or is stopped, as long as a session id was captured; otherwise `--continue` fails with exit 11 instead of starting fresh. A job whose runner died (reboot, kill) shows as interrupted.
 
 **Stalls.** Every brief tells the sub to run commands in the foreground and never leave background tasks running, because nobody collects them in a headless run (Claude subs also run with `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`). If a sub shows no activity for 15 minutes (`SUBHUB_IDLE` seconds, `0` turns it off), SubHub stops it as stalled (exit 12); a line that only repeats, like `waiting for 1 background task(s) to finish`, doesn't count as activity. 15 minutes is longer than one long command: Claude Code's Bash tool stops a command at 10 minutes. `SUBHUB_PLAIN=1` turns streaming off.
+
+## Updating the agent CLIs and model lists
+
+`subhub update` updates every agent CLI SubHub drives with that CLI's own update command (`claude update`, `codex update`, `agy update`, `cursor-agent update`, each found in its `--help`), shows old → new versions, then re-reads the model lists (Cursor, Antigravity, Ollama) and names new or removed models. Claude's aliases (`opus`, `sonnet`…) always run the newest model; `subhub models` shows what each one last ran as.
+
+```sh
+subhub update                 # all of them
+subhub update claude agy      # some
+subhub update --dry-run       # what would run, and current versions
+```
+
+It skips a CLI while one of its subs has a job running (an update could stop it); `--force` updates anyway. If an update fails because the CLI came from a package manager, it prints the right command (`brew upgrade …`, `npm install -g …@latest`). Ollama updates itself. `subhub update` never runs on its own. SubHub itself updates with its installer.
+
+## Usage, resets and planning
+
+SubHub tracks every account's limit windows (5-hour, weekly, per model group), how much of each is used and when it resets, so agents can plan: how many jobs to run at once on each account, which sub's unused headroom expires soonest, and whether to save or spend the caller's own account. It never sends a prompt for this.
+
+| Sub type | Where usage comes from |
+|---|---|
+| Claude Code (subs) | the `rate_limit_event` in every `subhub ask` run (5h, 7d and per-model weekly windows). SubHub also learns how much of the 5h window one job uses, to size parallel work |
+| Claude Code (your own session's account) | Claude Code's status line input (`rate_limits`, Pro and Max). `subhub connect claude` puts a small tap in front of your status line: it records the numbers, then runs your own status line command unchanged. `--no-statusline` or `"statusline": false` skips it; disconnect restores your status line |
+| Codex | `codex app-server` `account/rateLimits/read`, and `rate_limits` in `codex exec --json` runs |
+| Antigravity | `agy -p /quota --output-format json` (no turn, no tokens), per model group, after every run and on `subhub usage` |
+| Cursor, Ollama | not reported: treated as unknown, after subs with known headroom |
+
+`subhub usage [--json] [--refresh]` prints it; `subhub list` ends with a "Usage and plan" section, sorts subs by it, and tells the calling agent about its own account: near its limit, delegate everything; resetting soon with room left, use it now (the redirect hook then lets built-in sub-agents through). A window whose reset time has passed counts as unused. The macOS app shows it per sub.
 
 ## Which subs actually work
 
@@ -201,6 +229,8 @@ subhub remove <sub>
 subhub connect|disconnect <claude|codex|gemini|cursor|all> [--no-rules]
 ```
 
+Off means off: an off sub is refused by `subhub ask` (even with `--force` or `--continue`), left out of `subhub list`, skipped by the hook, the relay and `subhub check`, and its running jobs are stopped. A stopped job can be continued once the sub is on again.
+
 ## Repo layout
 
 ```
@@ -218,6 +248,7 @@ plugins/subhub/
   bin/subhub, bin/subhub.cmd      launchers for macOS/Linux and Windows
 test/smoke.mjs                    test against stand-in CLIs and a stand-in Ollama (CI: macOS, Linux, Windows)
 install.sh, install.ps1           one-line installers (macOS/Linux, Windows)
+SubHub/, SubHub.xcodeproj         optional macOS app (setup, switches and status)
 ```
 
 ## Requirements
