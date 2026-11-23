@@ -83,6 +83,7 @@ struct MainView: View {
             ToolbarItem(placement: .primaryAction) {
                 Menu {
                     Button("Claude Account or Organization…") { hub.terminal(["signin", "claude", "--new"]) }
+                    Button("Antigravity (Google) Account…") { hub.terminal(["signin", "gemini", "--new"]) }
                     if hub.installed {
                         Divider()
                         Button("Test Which Subs Work") { Task { await hub.subhub(["check"], timeout: 240) } }

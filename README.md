@@ -127,6 +127,16 @@ SubHub checks each CLI's `--help` for these flags; a CLI without them, or a stre
 
 **Stalls.** Every brief tells the sub to run commands in the foreground and never leave background tasks running, because nobody collects them in a headless run (Claude subs also run with `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`). If a sub shows no activity for 15 minutes (`SUBHUB_IDLE` seconds, `0` turns it off), SubHub stops it as stalled (exit 12); a line that only repeats, like `waiting for 1 background task(s) to finish`, doesn't count as activity. 15 minutes is longer than one long command: Claude Code's Bash tool stops a command at 10 minutes. `SUBHUB_PLAIN=1` turns streaming off.
 
+## More than one Antigravity account
+
+`agy` keeps one sign-in per computer, in the system keyring. To add a second Google account (for example one whose plan includes models the first doesn't), run in a terminal:
+
+```sh
+subhub signin gemini --new
+```
+
+The new sub (gemini-2, …) gets its own folder, `~/.subhub/accounts/gemini-N`. SubHub runs `agy --gemini_dir <folder>` with an SSH session in its environment, which makes agy keep that account's sign-in in a file in the folder instead of the keyring (as T3 Code does). After the sign-in SubHub checks that the keyring entry of the first account is unchanged (macOS: its modified date, never its contents) and that gemini-1 still reports its own email. Each account's models come from `agy acp` (no prompt sent), its usage from `/quota`, and its runs, follow-ups and checks all use its own folder.
+
 ## Updating the agent CLIs and model lists
 
 `subhub update` updates every agent CLI SubHub drives with that CLI's own update command (`claude update`, `codex update`, `agy update`, `cursor-agent update`, each found in its `--help`), shows old → new versions, then re-reads the model lists (Cursor, Antigravity, Ollama) and names new or removed models. Claude's aliases (`opus`, `sonnet`…) always run the newest model; `subhub models` shows what each one last ran as.

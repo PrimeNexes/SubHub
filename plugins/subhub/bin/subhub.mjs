@@ -25,7 +25,7 @@
 //   subhub install [--no-rules] [--no-check]   put subhub on PATH, connect every installed agent, check the subs
 //   subhub connect|disconnect <agent|all> [--no-rules]   claude, codex, gemini (Antigravity), cursor
 //                                      (connect adds an always-on rule to the agent's global rules file; SUBHUB_NO_RULES=1 skips it)
-//   subhub signin <sub> | signin claude --new [--email you@x.com] [--sso]   sign an account in (interactive)
+//   subhub signin <sub> | signin claude --new [--email you@x.com] [--sso] | signin gemini --new   sign an account in (interactive)
 //   subhub remove <sub> · subhub on|off <sub> · subhub config · subhub refresh · subhub version
 //   subhub ollama [--model M] [task]   a local Ollama model as an agent that can use your other subs
 //
@@ -40,7 +40,7 @@ import crypto from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-const VERSION = "0.8.0-alpha";
+const VERSION = "0.9.0-alpha";
 const WIN = process.platform === "win32", MAC = process.platform === "darwin";
 const HOME = os.homedir();
 const SH = path.join(HOME, ".subhub"), REG = path.join(SH, "registry.json"), CFG = path.join(SH, "config.json");
@@ -99,6 +99,10 @@ function envFor(provider, dir, base = process.env) {
   const env = { ...base };
   const key = provider === "claude" ? "CLAUDE_CONFIG_DIR" : provider === "codex" ? "CODEX_HOME" : null;
   if (key) { if (dir) env[key] = dir; else delete env[key]; }
+  // A second Antigravity account: agy keeps one sign-in in the system keyring, shared by every folder. With an SSH
+  // session in its environment it uses file-based token storage instead ("Using file-based token storage because SSH
+  // session detected"), and --gemini_dir puts that file in the account's own folder. The default account keeps the keyring.
+  if (provider === "gemini") { if (dir) env.SSH_CONNECTION ||= "127.0.0.1 0 127.0.0.1 0"; }
   if (!WIN) { env.USER ||= os.userInfo().username; env.LOGNAME ||= env.USER; }   // Claude reads its Keychain item by user name
   return env;
 }
@@ -150,12 +154,41 @@ function listCursorModels(bin) {
   const r = run(bin, ["--list-models"], { timeout: 60000 }), models = r.out.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").replace(/\u200b/g, "");
   if (r.code === 0 && / - /.test(models)) fs.writeFileSync(path.join(CACHE, "cursor-models.txt"), models);
 }
-function geminiWho(bin) {
-  const r = run(bin, ["models"], { timeout: 60000 });
-  if (r.code !== 0) return null;
-  fs.writeFileSync(path.join(CACHE, "gemini-models.txt"), r.out);
+/** agy's own flag for an account folder (`agy models` doesn't take it: models come from ACP there). */
+const agyDir = (dir) => (dir ? ["--gemini_dir", dir] : []);
+const geminiModelsFile = (dir) => path.join(CACHE, dir ? `gemini-models-${path.basename(dir)}.txt` : "gemini-models.txt");
+const geminiDirs = () => { const acc = path.join(SH, "accounts"); return isDir(acc) ? fs.readdirSync(acc).filter((f) => /^gemini-\d+$/.test(f) && isDir(path.join(acc, f))).map((f) => real(path.join(acc, f))) : []; };
+/** A folder account's models, from `agy acp` (session/new returns them; no prompt is sent). "id\tname" lines like `agy models`. */
+function agyAcpModels(bin, dir) {
+  const js = `const {spawn}=require("child_process");const c=spawn(process.argv[1],process.argv.slice(2),{stdio:["pipe","pipe","ignore"],cwd:process.argv[process.argv.length-3]});let b="",i=0;const P={};
+const q=(m,p)=>new Promise(r=>{const k=++i;P[k]=r;c.stdin.write(JSON.stringify({jsonrpc:"2.0",id:k,method:m,params:p})+"\\n")});
+c.stdout.on("data",d=>{b+=d;let k;while((k=b.indexOf("\\n"))>=0){const l=b.slice(0,k);b=b.slice(k+1);try{const m=JSON.parse(l);if(m.id&&P[m.id]){P[m.id](m);delete P[m.id]}}catch{}}});
+setTimeout(()=>{c.kill();process.exit(2)},45000);
+(async()=>{await q("initialize",{protocolVersion:1,clientInfo:{name:"subhub",version:"0"},clientCapabilities:{}});const s=await q("session/new",{cwd:process.cwd(),mcpServers:[]});
+if(s.error){console.log("ERROR "+(s.error.message||""));c.kill();process.exit(1)}console.log("SID "+s.result.sessionId);for(const m of s.result?.models?.availableModels||[])console.log(m.modelId+"\\t"+m.name);
+await Promise.race([q("session/close",{sessionId:s.result.sessionId}),new Promise(r=>setTimeout(r,3000))]);c.kill();process.exit(0)})();`;
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "subhub-acp-"));
+  try {
+    const r = run(process.execPath, ["-e", js, bin, "acp", ...agyDir(dir).map((x) => x.replace("_", "-")), "--app-data-dir", "antigravity-cli"], { env: envFor("gemini", dir), timeout: 60000, cwd: tmp });
+    const sid = (r.out.match(/^SID ([\w-]+)$/m) || [])[1];   // the empty session SubHub opened to read the list: remove its record
+    if (sid) for (const f of ls(path.join(dir, "antigravity-cli", "conversations"))) if (f.startsWith(sid + ".db")) fs.rmSync(path.join(dir, "antigravity-cli", "conversations", f), { force: true });
+    return { ...r, out: r.out.replace(/^SID .*\n?/m, "") };
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+}
+/** A folder account is signed in when agy saved a sign-in file there (how its runs sign in, too). */
+const agySignedIn = (dir) => ls(path.join(dir, "antigravity-cli")).some((f) => /token|oauth|cred/i.test(f) && !isDir(path.join(dir, "antigravity-cli", f)));
+function geminiWho(bin, dir = "", models = false) {
+  if (dir) {   // signed in = its sign-in file; the model list (ACP) is read only when missing, 6 hours old, or asked for
+    if (!agySignedIn(dir)) return null;
+    let age = Infinity; try { age = Date.now() - fs.statSync(geminiModelsFile(dir)).mtimeMs; } catch {}
+    if (models || age > 21600000) { const r = agyAcpModels(bin, dir); if (r.code === 0 && r.out.includes("\t")) fs.writeFileSync(geminiModelsFile(dir), r.out); }
+  } else {
+    const r = run(bin, ["models"], { timeout: 60000 });
+    if (r.code !== 0 || !r.out.includes("\t")) return null;
+    fs.writeFileSync(geminiModelsFile(dir), r.out);
+  }
   let email = "google account";
-  const logs = path.join(HOME, ".gemini", "antigravity-cli", "log");
+  const logs = path.join(dir || path.join(HOME, ".gemini"), "antigravity-cli", "log");
   try {
     const files = fs.readdirSync(logs).map((f) => path.join(logs, f)).sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
     for (const f of files.slice(0, 20)) {
@@ -225,7 +258,9 @@ async function refresh() {
   if ((b = binFor("claude"))) { track("claude", "", claudeWho(b, "")); for (const d of claudeDirs()) track("claude", d, claudeWho(b, d)); }
   if (binFor("codex")) for (const d of codexDirs()) track("codex", d, codexWho(d || path.join(HOME, ".codex")));
   if ((b = binFor("cursor"))) track("cursor", "", cursorWho(b));
-  if ((b = binFor("gemini"))) track("gemini", "", geminiWho(b));
+  if ((b = binFor("gemini"))) { track("gemini", "", geminiWho(b)); for (const d of geminiDirs()) track("gemini", d, geminiWho(b, d)); }
+  const accts = real(path.join(SH, "accounts"));   // an Antigravity account folder SubHub made and that is now gone: drop it
+  reg.subs = reg.subs.filter((s) => !(s.provider === "gemini" && s.dir && real(s.dir).startsWith(accts) && !pexist(s.dir)));
   if (binFor("ollama") || process.env.OLLAMA_HOST || reg.subs.some((s) => s.provider === "ollama")) {
     const models = await ollamaModels();
     let o = reg.subs.find((s) => s.provider === "ollama");
@@ -428,7 +463,7 @@ function findRateLimits(e, d = 0) {
 function agyQuota(s) {
   return new Promise((resolve) => {
     const bin = binFor("gemini"); if (!bin) return resolve(null);
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "subhub-quota-")), p = prep(bin, ["-p", "/quota", "--output-format", "json"]);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "subhub-quota-")), p = prep(bin, [...agyDir(s.dir), "-p", "/quota", "--output-format", "json"]);
     let out = "", c; const end = (v) => { clearTimeout(t); if (c?.pid) killTree(c.pid); fs.rmSync(dir, { recursive: true, force: true }); resolve(v); };
     const t = setTimeout(() => end(null), 30000);
     try { c = spawn(p.cmd, p.args, { ...p.opts, cwd: dir, env: envFor("gemini", s.dir), stdio: ["ignore", "pipe", "ignore"], windowsHide: true, detached: !WIN }); } catch { return end(null); }
@@ -678,7 +713,7 @@ function probeModel(s) {
   const cache = (f) => { try { return fs.readFileSync(path.join(CACHE, f), "utf8"); } catch { return ""; } };
   if (s.provider === "claude") return "haiku";
   if (s.provider === "cursor") return "auto";
-  if (s.provider === "gemini") { const ids = cache("gemini-models.txt").split("\n").map((l) => l.split("\t")[0]).filter(Boolean); return ids.find((i) => /flash.*lite/.test(i)) || ids.find((i) => /flash.*low/.test(i)) || ids.find((i) => /flash/.test(i)) || "default"; }
+  if (s.provider === "gemini") { const ids = cache(path.basename(geminiModelsFile(s.dir))).split("\n").map((l) => l.split("\t")[0]).filter(Boolean); return ids.find((i) => /flash.*lite/.test(i)) || ids.find((i) => /flash.*low/.test(i)) || ids.find((i) => /flash/.test(i)) || "default"; }
   if (s.provider === "codex") { let j; try { j = JSON.parse(run(binFor("codex"), ["debug", "models"], { env: envFor("codex", s.dir) }).out); } catch {} return (j?.models || []).filter((m) => m.visibility === "list").map((m) => m.slug).find((x) => /mini|nano|spark/.test(x)) || "default"; }
   const ms = readJSON(path.join(CACHE, "ollama-models.json")) || []; return (ms.find((m) => !m.caps.includes("embedding") || m.caps.includes("completion")))?.name || "default";
 }
@@ -717,6 +752,7 @@ async function checkSubs(names = []) {
     const me = isCaller(s); if (me) return skip("you", `this is you (${me}), not checked`);
     let h = await freeCheck(s), how = "free check";
     if (h?.usage) noteUsage(s.name, h.usage, "rate limits");
+    if (s.provider === "gemini" && s.dir && binFor("gemini")) geminiWho(binFor("gemini"), s.dir, true);   // check re-reads its model list
     if (s.provider === "gemini") { const w = await agyQuota(s); if (w) { noteUsage(s.name, w, "quota"); const lim = w.find((x) => !x.group && x.used >= 99.5); if (lim) h = { state: "limit", reason: `Antigravity ${lim.label} limit used up (/quota)`, resets: lim.resets }; } }
     if (!h) { h = await probe(s); how = `test prompt, model ${h.model}`; }
     return Object.assign(row, { result: h.state, reason: h.reason, resets: h.resets || null, how, health: h.state === "unknown" ? null : h });
@@ -748,7 +784,7 @@ function models(s, short) {
     case "claude": { const al = readJSON(path.join(CACHE, "claude-aliases.json")) || {};
       return CLAUDE_MODELS.map(([id, d]) => { const k = id.replace(/^'|'$/g, ""), a = al[k]; return `- \`${id}\`: ${d}${a ? ` (last ran as ${a.model})` : ""}`; })
         .concat(al.default ? [`- \`default\`: the account's own default (last ran as ${al.default.model})`] : []); }
-    case "gemini": return cache("gemini-models.txt").split("\n").filter((l) => l.includes("\t")).map((l) => {
+    case "gemini": return cache(path.basename(geminiModelsFile(s.dir))).split("\n").filter((l) => l.includes("\t")).map((l) => {
       const [id, name] = l.split("\t"); let n = "";
       if (/^gemini-.*flash/.test(id)) n = ". 1M-token context; reads images, audio and video";
       if (/-high$/.test(id)) n += "; thinks the most"; if (/-low$/.test(id)) n += "; thinks least, fastest";
@@ -798,7 +834,7 @@ async function refreshModels() {
   for (const [p, f] of Object.entries(ids)) before[p] = f();
   let b;
   if ((b = binFor("cursor"))) listCursorModels(b);
-  if ((b = binFor("gemini"))) { const r = run(b, ["models"], { timeout: 60000 }); if (r.code === 0 && r.out.trim()) fs.writeFileSync(path.join(CACHE, "gemini-models.txt"), r.out); }
+  if ((b = binFor("gemini"))) { const r = run(b, ["models"], { timeout: 60000 }); if (r.code === 0 && r.out.trim()) fs.writeFileSync(path.join(CACHE, "gemini-models.txt"), r.out); for (const d of geminiDirs()) geminiWho(b, d, true); }
   const om = await ollamaModels(); if (om) writeJSON(path.join(CACHE, "ollama-models.json"), om);
   for (const [p, f] of Object.entries(ids)) after[p] = f();
   return Object.keys(ids).map((p) => ({ provider: p, count: after[p].length, added: after[p].filter((x) => !before[p].includes(x)), removed: before[p].filter((x) => !after[p].includes(x)) }));
@@ -1013,6 +1049,7 @@ async function cmdAsk(argv) {
       Object.assign(env, envFor("claude", s.dir, env)); delete env.ANTHROPIC_API_KEY; delete env.ANTHROPIC_AUTH_TOKEN;
       env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = "1";   // documented: no background commands or agents for a headless sub
     } else if (s.provider === "codex") { Object.assign(env, envFor("codex", s.dir, env)); if (!s.dir) delete env.CODEX_HOME; }
+    else if (s.provider === "gemini" && s.dir) { Object.assign(env, envFor("gemini", s.dir, env)); job.dir = s.dir; }   // its own folder and file-based sign-in
     const c = caps(s.provider, bin);
     if (parent && !c.resume) die(11, `job ${parent.id} can't be continued: ${BINARY[s.provider]} on this computer has no resume option.`);
     Object.assign(job, { bin, stream: c.stream && !env.SUBHUB_PLAIN, settings: !!c.settings });
@@ -1139,7 +1176,7 @@ function cliArgs(j, brief) {
   else if (j.provider === "codex") a = sid ? ["exec", "resume", ...(sj ? ["--json"] : []), "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", ...m, sid, brief]
     : ["exec", ...(sj ? ["--json"] : []), "--sandbox", "danger-full-access", "--skip-git-repo-check", "-c", 'approval_policy="never"', ...m, brief];
   else if (j.provider === "cursor") a = ["--force", "--sandbox", "disabled", "--trust", "--approve-mcps", ...(sj ? ["--output-format", "stream-json"] : []), ...(sid ? ["--resume", sid] : []), ...m, "-p", brief];
-  else a = ["--dangerously-skip-permissions", ...(j.settings ? ["--settings", AGY_SETTINGS] : []), ...(sj ? ["--output-format", "stream-json"] : []), ...(sid ? ["--conversation", sid] : []), ...m, "-p", brief];
+  else a = [...(j.provider === "gemini" ? agyDir(j.dir) : []), "--dangerously-skip-permissions", ...(j.settings ? ["--settings", AGY_SETTINGS] : []), ...(sj ? ["--output-format", "stream-json"] : []), ...(sid ? ["--conversation", sid] : []), ...m, "-p", brief];
   if (isShim(j.bin)) {   // cmd.exe can't carry line breaks in an argument
     const i = a.lastIndexOf(brief);
     if (j.provider === "claude") { a.splice(i, 1); input = brief; }
@@ -1637,8 +1674,14 @@ async function cmdSignin(args) {
     inherit(binFor("claude") || die(127, "Claude Code isn't installed."), ["auth", "login", ...(email ? ["--email", email] : []), ...(args.includes("--sso") ? ["--sso"] : [])], envFor("claude", d));
     await refresh(); return;
   }
+  if (args[0] === "gemini" && args[1] === "--new") {
+    const reg = loadReg(), n = nextName(reg, "gemini"), d = path.join(SH, "accounts", n);
+    await agySignin(binFor("gemini") || die(127, "Antigravity CLI (agy) isn't installed."), d, n, reg);
+    return;
+  }
   const s = loadReg().subs.find((x) => x.name === args[0]) || die(2, `unknown sub '${args[0]}'.`);
   const b = binFor(s.provider) || die(127, `${s.name}'s CLI isn't installed.`);
+  if (s.provider === "gemini" && s.dir) { await agySignin(b, s.dir, s.name, loadReg(), s.email); return; }
   console.log(`Sign in as ${s.email}.`);
   if (s.provider === "claude") inherit(b, ["auth", "login", "--email", s.email], envFor("claude", s.dir));
   else if (s.provider === "codex") inherit(b, ["login"], envFor("codex", s.dir));
@@ -1646,6 +1689,38 @@ async function cmdSignin(args) {
   else if (s.provider === "gemini") inherit(b, []);
   else console.log("Ollama has no sign-in (cloud models: run `ollama signin`).");
   await refresh();
+}
+/** The default Antigravity sign-in's keyring entry: its modified date only (never its secret), to prove a sign-in left it alone. */
+function agyKeyringStamp() {
+  if (!MAC) return null;   // Linux/Windows keyrings: no read-only date to compare; the email check below still runs
+  const r = run("security", ["find-generic-password", "-s", "gemini", "-a", "antigravity"], { timeout: 10000 });
+  return r.code === 0 ? (r.out.match(/"mdat"<timedate>=\S+\s+"([^"]+)"/) || [])[1] || "present" : "none";
+}
+/** Signs a second (or later) Antigravity account in to its own folder, with file-based token storage, then proves the
+ * default account's sign-in (the system keyring) wasn't touched. The user runs this in a terminal: it opens a sign-in. */
+async function agySignin(bin, dir, name, reg, expect = "") {
+  const first = reg.subs.find((x) => x.provider === "gemini" && !x.dir);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const env = envFor("gemini", dir), before = agyKeyringStamp();
+  console.log(`Signing ${expect || "a new Google account"} in to Antigravity for ${name}, kept in ${dir}.`);
+  console.log("agy starts and shows a sign-in link: open it, sign in, paste the code back if asked. When agy is ready, leave it with /exit (or Ctrl+C twice).");
+  if (first) console.log(`Use a different Google account from ${first.name} (${first.email}).`);
+  spawnSync(prep(bin, agyDir(dir)).cmd, prep(bin, agyDir(dir)).args, { ...prep(bin, agyDir(dir)).opts, env, stdio: "inherit", cwd: dir });
+  const problems = [];
+  const after = agyKeyringStamp(); if (before && after !== before) problems.push(`the default Antigravity sign-in in the system keyring changed (${before} → ${after})`);
+  const files = []; const walk = (d, k = 0) => { for (const f of ls(d)) { const p = path.join(d, f); if (isDir(p) && k < 3) walk(p, k + 1); else if (/token|oauth|cred/i.test(f)) files.push(f); } }; walk(dir);
+  if (!files.length) problems.push(`no sign-in file was saved in ${dir} (did the sign-in finish?)`);
+  const who = files.length ? geminiWho(bin, dir) : null;   // who signed in, read from the folder itself
+  const reg2 = await refresh(), mine = reg2.subs.find((x) => x.provider === "gemini" && x.dir && real(x.dir) === real(dir)), one = reg2.subs.find((x) => x.provider === "gemini" && !x.dir);
+  if (first && (!one || one.state !== "ok" || one.email !== first.email)) problems.push(`${first.name} no longer reports ${first.email}`);
+  if (who && first && who.email === first.email) problems.push(`${name} signed in as the same Google account as ${first.name} (${first.email}); SubHub won't add it twice. Run this again and pick another account`);
+  if (problems.length) {
+    console.log(`\nSomething isn't right:\n${problems.map((x) => "  - " + x).join("\n")}`);
+    if (first) console.log(`If ${first.name} stopped working, sign it in again: run \`agy\`, then /login as ${first.email}.`);
+    process.exitCode = 1;
+  }
+  if (mine?.state === "ok") console.log(`\n${mine.name}: ${mine.email}. Test it with: subhub check ${mine.name}`);
+  else if (!problems.length) console.log(`\n${name} isn't signed in yet. Run this again to finish.`);
 }
 function cmdRemove(name) {
   const reg = loadReg(), s = reg.subs.find((x) => x.name === name) || die(2, `unknown sub '${name}'.`);

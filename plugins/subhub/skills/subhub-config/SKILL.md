@@ -42,6 +42,7 @@ Changes apply on the next `subhub ask` call.
 ## Accounts and agents (tell the user to run these in a terminal: sign-ins are interactive)
 - Sign a sub in again: `subhub signin <sub>`
 - Add another Claude account or organization (for example the team side of an email): `subhub signin claude --new --email you@company.com`, then pick the organization in the browser.
+- Add another Antigravity (Google) account: `subhub signin gemini --new`. It gets its own folder (`~/.subhub/accounts/gemini-N`) and keeps its sign-in in a file there, so the first account's sign-in (the system keyring) is untouched; SubHub checks that afterwards.
 - Stop using a sub: `subhub remove <sub>`
 - Connect or disconnect an agent: `subhub connect <claude|codex|gemini|cursor|all>`, `subhub disconnect …`
 - Connecting also adds a short always-on rule (between `<!-- subhub:start` and `<!-- subhub:end -->`) to that agent's global rules file, so it uses subs before built-in sub-agents: `~/.claude/CLAUDE.md`, Codex's `AGENTS.md`, `~/.gemini/config/AGENTS.md`; Cursor has none. `subhub status` shows where. To connect without it: `subhub connect <agent> --no-rules`. To remove it: `subhub disconnect <agent>`, or delete the marked lines. Don't edit inside the markers: the next connect replaces them.

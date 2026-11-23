@@ -75,6 +75,23 @@ if (tool === "claude") {
   if (a[0] === "status") { console.log("Logged in as cur@x.com\\nTeam: Acme Team (id 1)"); process.exit(0); }
   if (a[0] === "--list-models") { console.log("Available models\\n\\nauto - Auto (default)\\ngpt-5.3-codex-high - Codex 5.3 High\\nclaude-opus-5-thinking-high - Claude Opus 5 1M Thinking"); process.exit(0); }
 } else if (tool === "agy") {
+  // a second account: --gemini_dir <folder> (or acp --gemini-dir) with SSH_CONNECTION set; signed in when <folder>/antigravity-cli/oauth-token exists
+  const gi = a.findIndex((x) => x === "--gemini_dir" || x === "--gemini-dir"), gdir = gi >= 0 ? a[gi + 1] : "";
+  if (gi >= 0) a.splice(gi, 2);
+  const gsigned = !gdir || (process.env.SSH_CONNECTION && fs.existsSync(path.join(gdir, "antigravity-cli", "oauth-token")));
+  globalThis.GDIR = gdir;
+  if (a[0] === "acp") {   // ACP: initialize, session/new with the account's models; no prompt
+    logCall("agy acp " + (gdir ? "dir" : "default")); let buf = "";
+    process.stdin.on("data", (d) => { buf += d; let i; while ((i = buf.indexOf("\\n")) >= 0) { const m = JSON.parse(buf.slice(0, i)); buf = buf.slice(i + 1);
+      if (m.method === "initialize") j({ jsonrpc: "2.0", id: m.id, result: { protocolVersion: 1 } });
+      else if (m.method === "session/new") j(gsigned ? { jsonrpc: "2.0", id: m.id, result: { sessionId: "s1", models: { availableModels: [{ modelId: "gemini-4-neon-high", name: "Gemini 4 Neon (High)" }, { modelId: "gemini-3.8-flash-low", name: "Gemini 3.8 Flash (Low)" }] } } } : { jsonrpc: "2.0", id: m.id, error: { code: -32000, message: "Authentication required" } }); } });
+    await new Promise(() => {});
+  }
+  if (gdir && !a.length) {   // interactive sign-in: STANDIN_LOGIN_EMAIL decides who signs in; unset = gave up
+    if (process.env.STANDIN_LOGIN_EMAIL && process.env.SSH_CONNECTION) { fs.mkdirSync(path.join(gdir, "antigravity-cli", "log"), { recursive: true }); fs.writeFileSync(path.join(gdir, "antigravity-cli", "oauth-token"), "x"); fs.writeFileSync(path.join(gdir, "antigravity-cli", "log", "cli-0.log"), "applyAuthResult: email=" + process.env.STANDIN_LOGIN_EMAIL + ", tier=pro\\n"); }
+    process.exit(0);
+  }
+  if (gdir && !gsigned && a.includes("-p")) { console.log("Authentication required. Please visit the URL to log in:"); process.exit(1); }
   if (a[0] === "models") { console.log("gemini-3.8-flash-high\\tGemini 3.8 Flash (High)\\ngemini-3.8-flash-low\\tGemini 3.8 Flash (Low)" + (fs.existsSync(VERF) ? "\\ngemini-4-pro\\tGemini 4 Pro" : "")); process.exit(0); }
   if (a.includes("/quota")) {   // agy -p /quota --output-format json: no turn, no tokens
     logCall("agy quota"); const at = (h) => new Date(Date.now() + h * 3600000).toISOString().replace(/\\.\\d+Z$/, "Z");
@@ -135,7 +152,7 @@ else {
   if (brief.includes("SLOW")) for (const s of "ABCDEF") { out.tool("step " + s); await sleep(400); }
   if (brief.includes("EDIT")) fs.writeFileSync("made.txt", "hi");
   const r = resumed ? " resumed:" + resumed : "";
-  out.end(tool === "agy" ? "gemini ran: " + brief.split("\\n")[1] + r : JSON.stringify({ tool, argv: a, resumed, dir: process.env.CLAUDE_CONFIG_DIR || "default", token: process.env.CLAUDE_CODE_OAUTH_TOKEN || "none", bg: process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS || "" }));
+  out.end(tool === "agy" ? "gemini ran: " + brief.split("\\n")[1] + r + (globalThis.GDIR ? " [dir=" + globalThis.GDIR + " ssh=" + (process.env.SSH_CONNECTION ? "yes" : "no") + "]" : " [default ssh=" + (process.env.SSH_CONNECTION ? "yes" : "no") + "]") : JSON.stringify({ tool, argv: a, resumed, dir: process.env.CLAUDE_CONFIG_DIR || "default", token: process.env.CLAUDE_CODE_OAUTH_TOKEN || "none", bg: process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS || "" }));
 }
 }
 `);
@@ -578,6 +595,27 @@ ok(["claude", "codex", "gemini", "cursor"].every((p) => !fs.existsSync(path.join
 r = await sh(["models", "gemini-1"]); ok(r.out.includes("gemini-4-pro"), "the new model is offered right away");
 r = await sh(["models", claude2]); ok(/`opus`: .*\(last ran as m\)/.test(r.out), "Claude models show what each alias last ran as", r.out);
 c0 = calls().length; await sh(["list"]); await sh(["status"]); ok(!calls().slice(c0).some((c) => / update$/.test(c)), "list and status never update anything");
+
+// 6d. a second Antigravity account in its own folder, with file-based sign-in
+const G2 = path.join(H, ".subhub", "accounts", "gemini-2"), G3 = path.join(H, ".subhub", "accounts", "gemini-3");
+mk(path.join(G2, "antigravity-cli", "oauth-token"), "x"); mk(path.join(G2, "antigravity-cli", "log", "cli-1.log"), "I1124 applyAuthResult: email=Two@X.com, tier=pro\n");
+fs.mkdirSync(G3, { recursive: true });   // a folder nobody signed in to
+r = await sh(["status", "--json", "--refresh"]); let gsubs = {}; try { for (const x of JSON.parse(r.out).subs) gsubs[x.name] = x; } catch {}
+ok(gsubs["gemini-2"]?.email === "two@x.com" && gsubs["gemini-2"].state === "ok" && fs.realpathSync(gsubs["gemini-2"].folder) === fs.realpathSync(G2), "a second Antigravity account in ~/.subhub/accounts/gemini-2 is found, with its own email", r.out);
+ok(!gsubs["gemini-3"] && gsubs["gemini-1"]?.state === "ok", "a folder nobody signed in to isn't added; gemini-1 is unchanged", JSON.stringify(Object.keys(gsubs)));
+r = await sh(["models", "gemini-2"]); ok(r.out.includes("gemini-4-neon-high"), "gemini-2's models come from agy acp (its own account's list)", r.out);
+r = await sh(["models", "gemini-1"]); ok(!r.out.includes("gemini-4-neon"), "gemini-1 keeps its own model list", r.out);
+r = await sh(["ask", "gemini-2", "default", "x\nhello"]); ok(r.code === 0 && r.out.includes(`[dir=${fs.realpathSync(G2)} ssh=yes]`), "gemini-2 runs with --gemini_dir and file-based sign-in", r.out + r.err);
+r = await sh(["ask", "gemini-1", "default", "x\nhello"]); ok(r.code === 0 && r.out.includes("[default ssh=no]"), "gemini-1 still runs on the default sign-in", r.out + r.err);
+fs.rmSync(G2, { recursive: true, force: true }); fs.rmSync(G3, { recursive: true, force: true }); await sh(["status", "--refresh"]);
+// signin gemini --new: its own folder, file-based sign-in, and checks that gemini-1 was left alone
+const g1mail = gsubs["gemini-1"]?.email;
+r = await sh(["signin", "gemini", "--new"]); ok(r.code === 1 && /no sign-in file was saved/.test(r.out), "signin gemini --new: a sign-in that didn't finish is reported (exit 1)", r.out + r.err);
+r = await sh(["signin", "gemini", "--new"], { env: { STANDIN_LOGIN_EMAIL: g1mail } }); ok(r.code === 1 && /same Google account as gemini-1/.test(r.out), "signin gemini --new: the same account as gemini-1 is reported (exit 1)", r.out + r.err);
+fs.rmSync(G2, { recursive: true, force: true }); await sh(["status", "--refresh"]);
+r = await sh(["signin", "gemini", "--new"], { env: { STANDIN_LOGIN_EMAIL: "new@x.com" } });
+ok(r.code === 0 && /gemini-2: new@x\.com\. Test it with: subhub check gemini-2/.test(r.out) && !/isn't right/.test(r.out), "signin gemini --new adds gemini-2 in its own folder, gemini-1 untouched", r.out + r.err);
+fs.rmSync(G2, { recursive: true, force: true }); await sh(["status", "--refresh"]);
 
 // 7. install and remove
 r = await sh(["install"], { env: { SUBHUB_REPO: ROOT } });

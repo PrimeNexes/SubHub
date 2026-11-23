@@ -72,7 +72,7 @@ let bundledVersion: String = {
           let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return "" }
     return j["version"] as? String ?? ""
 }()
-/// True when version `a` is newer than `b` (numbers only: "0.8.0-alpha" counts as 0.8.0).
+/// True when version `a` is newer than `b` (numbers only: "0.9.0-alpha" counts as 0.9.0).
 func newer(_ a: String, than b: String) -> Bool {
     let n = { (v: String) in v.split(separator: "-").first.map { $0.split(separator: ".").map { Int($0) ?? 0 } } ?? [] }
     let x = n(a), y = n(b)
